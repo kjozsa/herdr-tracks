@@ -1,9 +1,9 @@
 //! Docking the sidebar as a right-edge split of a tab, sized to herdr's left sidebar.
 
 use crate::herdr::{self, Layout, PaneInfo};
-use crate::state::{DockGuard, TabEntry};
+use crate::state::DockGuard;
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// herdr's defaults for `[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`.
@@ -29,89 +29,62 @@ fn context_tab() -> Result<String> {
         .ok_or_else(|| anyhow!("no tab in plugin context; run from inside herdr"))
 }
 
-/// Auto-dock (event hooks): add a sidebar to the context tab if it hosts an agent, has none,
-/// and the user has not closed it there.
+/// Event hooks: keep a sidebar in the context tab whenever it hosts an agent. A closed sidebar
+/// docks again straight away (`pane.closed`): it is not meant to be dismissed.
 pub fn ensure() -> Result<()> {
-    let tab = context_tab()?;
+    place(false)
+}
+
+/// Action: show the sidebar in the focused tab, even one without an agent.
+pub fn show() -> Result<()> {
+    place(true)
+}
+
+fn place(without_agent: bool) -> Result<()> {
     let mut guard = DockGuard::acquire()?;
+    let tab = match closed_sidebar_tab(&guard.state.tabs) {
+        Some(tab) => tab,
+        None => context_tab()?,
+    };
     let panes = herdr::pane_list()?;
     let tab_panes: Vec<&PaneInfo> = panes.iter().filter(|p| p.tab_id == tab).collect();
-    if let Some(entry) = guard.state.tabs.get_mut(&tab) {
-        if entry.closed {
-            return Ok(());
-        }
-        if let Some(id) = &entry.pane_id {
-            if !tab_panes.iter().any(|p| &p.pane_id == id) {
-                // Closed through herdr itself: treat like an explicit close.
-                entry.closed = true;
-                guard.save()?;
-            }
-            return Ok(());
-        }
-    }
-    if !tab_panes.iter().any(|p| p.agent.is_some()) {
+    if guard.state.tabs.get(&tab).is_some_and(|id| tab_panes.iter().any(|p| &p.pane_id == id)) {
         return Ok(());
     }
-    let pane_id = match find_sidebar(&tab_panes)? {
+    if tab_panes.is_empty() || !(without_agent || tab_panes.iter().any(|p| p.agent.is_some())) {
+        return Ok(());
+    }
+    let pane = match find_sidebar(&tab_panes)? {
         Some(id) => id,
         None => match dock(&tab_panes)? {
             Some(id) => id,
+            None if without_agent => bail!("tab {tab} cannot fit a sidebar (zoomed or too narrow)"),
             None => return Ok(()),
         },
     };
-    guard.state.tabs.insert(tab, TabEntry { pane_id: Some(pane_id), closed: false });
+    guard.state.tabs.insert(tab, pane);
     guard.save()
 }
 
-/// Action: close the context tab's sidebar, or dock one.
-pub fn toggle() -> Result<()> {
-    let tab = context_tab()?;
-    let mut guard = DockGuard::acquire()?;
-    let panes = herdr::pane_list()?;
-    let tab_panes: Vec<&PaneInfo> = panes.iter().filter(|p| p.tab_id == tab).collect();
-    let recorded = guard
-        .state
-        .tabs
-        .get(&tab)
-        .and_then(|e| e.pane_id.clone())
-        .filter(|id| tab_panes.iter().any(|p| &p.pane_id == id));
-    let entry = match recorded.map_or_else(|| find_sidebar(&tab_panes), |id| Ok(Some(id)))? {
-        Some(open) => {
-            herdr::pane_close(&open)?;
-            TabEntry { pane_id: None, closed: true }
-        }
-        None => {
-            let id = dock(&tab_panes)?.ok_or_else(|| anyhow!("tab {tab} cannot fit a sidebar"))?;
-            TabEntry { pane_id: Some(id), closed: false }
-        }
-    };
-    guard.state.tabs.insert(tab, entry);
-    guard.save()
+/// For a `pane.closed` hook on a sidebar pane: the tab it was docked in. The event names only
+/// the pane, and herdr's context then describes whichever tab is focused.
+fn closed_sidebar_tab(tabs: &BTreeMap<String, String>) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_str(&std::env::var("HERDR_PLUGIN_EVENT_JSON").ok()?).ok()?;
+    let data = &event["data"];
+    if data["type"] != "pane_closed" {
+        return None;
+    }
+    let closed = data["pane_id"].as_str()?;
+    tabs.iter().find(|(_, pane)| pane.as_str() == closed).map(|(tab, _)| tab.clone())
 }
 
-/// Startup hook: drop state for tabs that no longer exist, and forget sidebars that did not
-/// survive the restart so their tabs dock again. Explicit closes are kept.
+/// Startup hook: forget sidebars that did not survive the restart, so their tabs dock again.
 pub fn startup() -> Result<()> {
     let mut guard = DockGuard::acquire()?;
     let panes = herdr::pane_list()?;
-    let live_panes: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
-    let live_tabs: HashSet<&str> = panes.iter().map(|p| p.tab_id.as_str()).collect();
-    guard.state.tabs.retain(|tab, e| {
-        live_tabs.contains(tab.as_str())
-            && (e.closed || e.pane_id.as_deref().is_some_and(|id| live_panes.contains(id)))
-    });
+    let live: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
+    guard.state.tabs.retain(|_, pane| live.contains(pane.as_str()));
     guard.save()
-}
-
-/// Called by the sidebar itself when the user quits it: remember the close, then close the pane.
-pub fn close_self(pane_id: &str) -> Result<()> {
-    {
-        let mut guard = DockGuard::acquire()?;
-        let tab = herdr::pane_layout(pane_id)?.tab_id;
-        guard.state.tabs.insert(tab, TabEntry { pane_id: None, closed: true });
-        guard.save()?;
-    }
-    herdr::pane_close(pane_id)
 }
 
 /// A sidebar process already running in one of `panes` (state lost or never recorded).

@@ -134,6 +134,11 @@ pub fn pane_close(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn pane_focus(pane_id: &str) -> Result<()> {
+    call("pane.focus", json!({"pane_id": pane_id}))?;
+    Ok(())
+}
+
 /// Opens a plugin pane entrypoint as a right split of `target_pane_id` and returns its id.
 /// `env` is added to the pane process's environment.
 pub fn open_plugin_pane(

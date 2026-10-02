@@ -23,14 +23,20 @@ placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" diff"]
 
 [[actions]]
-id = "toggle"
-title = "Git Sidebar: toggle"
+id = "show"
+title = "Git Sidebar: show"
+description = "Dock the sidebar in this tab, even without an agent."
 contexts = ["workspace", "pane"]
-command = ["target/release/herdr-git-sidebar", "toggle"]
+command = ["target/release/herdr-git-sidebar", "show"]
 
-# Auto-dock into tabs that host an agent. Idempotent; skips tabs where the user closed it.
+# The sidebar is mandatory in tabs that host an agent: these idempotent hooks dock it, and
+# `pane.closed` brings it straight back when it is closed.
 [[events]]
 on = "pane.agent_detected"
+command = ["target/release/herdr-git-sidebar", "ensure"]
+
+[[events]]
+on = "pane.closed"
 command = ["target/release/herdr-git-sidebar", "ensure"]
 
 [[events]]

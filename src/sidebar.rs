@@ -11,7 +11,7 @@ use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
 use crate::transcript::{Format, Touch, Transcript};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
@@ -27,6 +27,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const GIT_EVERY: Duration = Duration::from_secs(5);
 const PR_EVERY: Duration = Duration::from_secs(30);
+/// Delay before the selected file's diff opens, so holding an arrow key skips through.
+const DIFF_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Which chat session the sidebar follows, and whether its repo set is persisted.
 struct Session {
@@ -49,8 +51,14 @@ struct Model {
     pr_errors: HashMap<String, String>,
     /// In-flight PR status refresh (runs `gh` off the UI thread).
     pr_job: Option<Receiver<PrBatch>>,
-    /// Diff pane opened by the last file click; replaced by the next one.
+    /// The diff pane currently shown; the next diff replaces it.
     diff_pane: Option<String>,
+    /// File chosen with the arrow keys or a click, as (checkout root, path); its diff is shown.
+    selected: Option<(PathBuf, String)>,
+    /// When the selected file's diff should open; holding an arrow key opens only the last one.
+    diff_due: Option<Instant>,
+    /// First rendered row on screen when the list is taller than the pane.
+    scroll: usize,
 }
 
 /// What a click on a sidebar row does.
@@ -62,10 +70,38 @@ enum Click {
     Pr { url: String },
 }
 
-/// Rendered rows plus the click target of each clickable row (by row index).
+/// All rendered rows plus the click target of each clickable row (by row index).
 struct Screen {
     lines: Vec<Line>,
     clicks: HashMap<usize, Click>,
+}
+
+impl Screen {
+    /// Changed files in display order, as (row, checkout root, change).
+    fn files(&self) -> Vec<(usize, &PathBuf, &Change)> {
+        let mut files: Vec<_> = self
+            .clicks
+            .iter()
+            .filter_map(|(row, click)| match click {
+                Click::File { root, change } => Some((*row, root, change)),
+                Click::Pr { .. } => None,
+            })
+            .collect();
+        files.sort_by_key(|(row, ..)| *row);
+        files
+    }
+
+    fn row_of(&self, selected: Option<&(PathBuf, String)>) -> Option<usize> {
+        let (root, path) = selected?;
+        self.files().into_iter().find(|(_, r, c)| *r == root && c.path == *path).map(|(row, ..)| row)
+    }
+}
+
+/// The part of a [`Screen`] that fits the pane; clicks keyed by on-screen row.
+struct View {
+    lines: Vec<Line>,
+    clicks: HashMap<usize, Click>,
+    highlight: Option<usize>,
 }
 
 struct PrBatch {
@@ -75,20 +111,14 @@ struct PrBatch {
 
 pub fn run() -> Result<()> {
     let me = std::env::var("HERDR_PANE_ID").map_err(|_| anyhow!("HERDR_PANE_ID not set"))?;
-    let quit = {
-        let _term = Term::enter()?;
-        event_loop(&me)?
-    };
-    if quit {
-        crate::dock::close_self(&me)?;
-    }
-    Ok(())
+    let _term = Term::enter()?;
+    event_loop(&me)
 }
 
-/// Runs until the user quits (`true`) or the terminal goes away (`false`).
-fn event_loop(me: &str) -> Result<bool> {
+/// Runs for the pane's lifetime. There is no quit key: the sidebar is mandatory.
+fn event_loop(me: &str) -> Result<()> {
     let mut model = Model::default();
-    let mut shown: Vec<Line> = Vec::new();
+    let mut shown: (Vec<Line>, Option<usize>) = (Vec::new(), None);
     let mut next_sample = Instant::now();
     let mut next_git = Instant::now();
     let mut next_pr = Instant::now();
@@ -129,33 +159,85 @@ fn event_loop(me: &str) -> Result<bool> {
             next_pr = now + PR_EVERY;
             model.pr_job = start_pr_refresh(&model);
         }
-        let (cols, rows) = terminal::size()?;
-        let screen = render(&model, usize::from(cols), usize::from(rows));
-        if screen.lines != shown {
-            draw(&screen.lines)?;
-            shown = screen.lines;
+        if model.diff_due.is_some_and(|due| now >= due) {
+            model.diff_due = None;
+            if let Err(e) = show_selected_diff(&mut model) {
+                model.error = Some(format!("{e:#}"));
+            }
         }
-        let wait = next_sample.min(next_git).saturating_duration_since(Instant::now());
-        if event::poll(wait)? {
-            match event::read()? {
-                Event::Key(KeyEvent { code: KeyCode::Char('q'), .. }) => return Ok(true),
-                Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    return Ok(true)
+        let (cols, rows) = terminal::size()?;
+        let screen = render(&model, usize::from(cols));
+        let selected_row = screen.row_of(model.selected.as_ref());
+        let view = window(&screen, usize::from(cols), usize::from(rows), &mut model.scroll, selected_row);
+        if (&view.lines, view.highlight) != (&shown.0, shown.1) {
+            draw(&view, usize::from(cols))?;
+            shown = (view.lines.clone(), view.highlight);
+        }
+        let mut deadline = next_sample.min(next_git);
+        if let Some(due) = model.diff_due {
+            deadline = deadline.min(due);
+        }
+        if event::poll(deadline.saturating_duration_since(Instant::now()))? {
+            let result = match event::read()? {
+                Event::Key(KeyEvent { code: KeyCode::Down | KeyCode::Char('j'), .. }) => {
+                    move_selection(&mut model, &screen, 1);
+                    Ok(())
                 }
-                Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, .. }) => {
-                    if let Some(click) = screen.clicks.get(&usize::from(row)) {
-                        if let Err(e) = handle_click(&mut model, click) {
-                            model.error = Some(format!("{e:#}"));
-                        }
+                Event::Key(KeyEvent { code: KeyCode::Up | KeyCode::Char('k'), .. }) => {
+                    move_selection(&mut model, &screen, -1);
+                    Ok(())
+                }
+                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => match &model.diff_pane {
+                    Some(pane) => herdr::pane_focus(pane),
+                    None => Ok(()),
+                },
+                Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                    model.selected = None;
+                    model.diff_due = None;
+                    match model.diff_pane.take() {
+                        Some(pane) => herdr::pane_close(&pane),
+                        None => Ok(()),
                     }
                 }
-                Event::Resize(..) => shown.clear(),
-                _ => {}
+                Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, .. }) => {
+                    match view.clicks.get(&usize::from(row)) {
+                        Some(click) => handle_click(&mut model, click),
+                        None => Ok(()),
+                    }
+                }
+                Event::Resize(..) => {
+                    shown = (Vec::new(), None);
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = result {
+                model.error = Some(format!("{e:#}"));
             }
         }
     }
+}
+
+/// Moves the selection `step` files down (or up), clamped to the list; the diff follows
+/// once the keys settle.
+fn move_selection(model: &mut Model, screen: &Screen, step: isize) {
+    let files = screen.files();
+    let Some(last) = files.len().checked_sub(1) else { return };
+    let current = model
+        .selected
+        .as_ref()
+        .and_then(|(root, path)| files.iter().position(|(_, r, c)| *r == root && c.path == *path));
+    let next = match current {
+        Some(i) => i.saturating_add_signed(step).min(last),
+        None if step > 0 => 0,
+        None => last,
+    };
+    if Some(next) == current {
+        return;
+    }
+    let (_, root, change) = files[next];
+    model.selected = Some((root.clone(), change.path.clone()));
+    model.diff_due = Some(Instant::now() + DIFF_DEBOUNCE);
 }
 
 fn handle_click(model: &mut Model, click: &Click) -> Result<()> {
@@ -170,20 +252,30 @@ fn handle_click(model: &mut Model, click: &Click) -> Result<()> {
                 .context("xdg-open")?;
         }
         Click::File { root, change } => {
-            let agent = model.session.as_ref().map(|s| s.pane_id.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
-            if let Some(previous) = model.diff_pane.take() {
-                let _ = herdr::pane_close(&previous); // already closed by the user is fine
-            }
-            let request = serde_json::to_string(&DiffRequest::new(root, change))?;
-            let pane = herdr::open_plugin_pane(
-                &crate::dock::plugin_id(),
-                crate::DIFF_ENTRYPOINT,
-                &agent,
-                true,
-                &[(crate::diff::ENV, request)],
-            )?;
-            model.diff_pane = Some(pane);
+            model.selected = Some((root.clone(), change.path.clone()));
+            model.diff_due = None;
+            show_selected_diff(model)?;
         }
+    }
+    Ok(())
+}
+
+/// Shows the selected file's diff without taking focus from the sidebar. The new pane is split
+/// off the previous diff pane, which then closes, so the layout holds still while browsing.
+fn show_selected_diff(model: &mut Model) -> Result<()> {
+    let Some((root, path)) = &model.selected else { return Ok(()) };
+    let Some(Ok(status)) = model.statuses.get(root) else { return Ok(()) };
+    let Some(change) = status.changes.iter().find(|c| &c.path == path) else { return Ok(()) };
+    let agent = model.session.as_ref().map(|s| s.pane_id.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
+    let env = [(crate::diff::ENV, serde_json::to_string(&DiffRequest::new(root, change))?)];
+    let open = |target: &str| herdr::open_plugin_pane(&crate::dock::plugin_id(), crate::DIFF_ENTRYPOINT, target, false, &env);
+    let pane = match model.diff_pane.as_deref() {
+        // The previous diff pane may already be gone (the user quit it): fall back to the agent.
+        Some(previous) => open(previous).or_else(|_| open(&agent))?,
+        None => open(&agent)?,
+    };
+    if let Some(previous) = model.diff_pane.replace(pane) {
+        let _ = herdr::pane_close(&previous);
     }
     Ok(())
 }
@@ -406,7 +498,7 @@ enum Tone {
 
 type Line = Vec<(String, Tone)>;
 
-fn render(model: &Model, cols: usize, rows: usize) -> Screen {
+fn render(model: &Model, cols: usize) -> Screen {
     let mut lines: Vec<Line> = Vec::new();
     let mut clicks: HashMap<usize, Click> = HashMap::new();
     if let Some(err) = &model.error {
@@ -414,7 +506,7 @@ fn render(model: &Model, cols: usize, rows: usize) -> Screen {
     }
     let Some(session) = &model.session else {
         lines.push(vec![(fit_end("no agent in this tab", cols), Tone::Dim)]);
-        return clip(Screen { lines, clicks }, cols, rows);
+        return Screen { lines, clicks };
     };
     if !session.title.is_empty() {
         lines.push(vec![(fit_end(&session.title, cols), Tone::Dim)]);
@@ -467,7 +559,7 @@ fn render(model: &Model, cols: usize, rows: usize) -> Screen {
         clicks.insert(lines.len(), Click::Pr { url: pr.pr.url() });
         lines.push(pr_line(pr, model.pr_errors.get(&pr.pr.url()), cols));
     }
-    clip(Screen { lines, clicks }, cols, rows)
+    Screen { lines, clicks }
 }
 
 /// ` #121 open ✓`: number (a link to the PR), state, CI rollup (omitted when the PR has no checks).
@@ -534,16 +626,34 @@ fn change_tone(code: [u8; 2]) -> Tone {
     }
 }
 
-/// Keeps the screen's worth of rows, replacing the overflow with a count; rows cut off lose
-/// their click targets.
-fn clip(mut screen: Screen, cols: usize, rows: usize) -> Screen {
-    if screen.lines.len() > rows && rows > 0 {
-        let hidden = screen.lines.len() - (rows - 1);
-        screen.lines.truncate(rows - 1);
-        screen.clicks.retain(|row, _| *row < rows - 1);
-        screen.lines.push(vec![(fit_end(&format!("… {hidden} more lines"), cols), Tone::Dim)]);
+/// The rows that fit a `rows`-high pane. Scrolls so `selected` stays visible; when rows are
+/// left below, the last line counts them instead. Clicks are re-keyed to on-screen rows.
+fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usize, selected: Option<usize>) -> View {
+    let total = screen.lines.len();
+    if total <= rows {
+        *scroll = 0;
+        return View { lines: screen.lines.clone(), clicks: screen.clicks.clone(), highlight: selected };
     }
-    screen
+    let body = rows.saturating_sub(1);
+    if let Some(row) = selected {
+        if row < *scroll {
+            *scroll = row;
+        } else if row >= *scroll + body {
+            *scroll = row + 1 - body;
+        }
+    }
+    *scroll = (*scroll).min(total - body);
+    let end = *scroll + body;
+    let mut lines = screen.lines[*scroll..end].to_vec();
+    if end < total {
+        lines.push(vec![(fit_end(&format!("… {} more lines", total - end), cols), Tone::Dim)]);
+    }
+    let in_view = |row: usize| (*scroll..end).contains(&row).then(|| row - *scroll);
+    View {
+        lines,
+        clicks: screen.clicks.iter().filter_map(|(row, click)| Some((in_view(*row)?, click.clone()))).collect(),
+        highlight: selected.and_then(in_view),
+    }
 }
 
 /// Truncates keeping the start: `long-branch-na…`.
@@ -587,17 +697,27 @@ fn fit_start(s: &str, max: usize) -> String {
     out
 }
 
-fn draw(lines: &[Line]) -> Result<()> {
+fn draw(view: &View, cols: usize) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    for (row, line) in lines.iter().enumerate() {
+    for (row, line) in view.lines.iter().enumerate() {
+        let highlighted = view.highlight == Some(row);
         queue!(out, cursor::MoveTo(0, row as u16))?;
         for (text, tone) in line {
             style(&mut out, *tone)?;
+            if highlighted {
+                queue!(out, SetAttribute(Attribute::Reverse))?;
+            }
             queue!(out, Print(text), SetAttribute(Attribute::Reset), ResetColor)?;
+        }
+        if highlighted {
+            // Highlighted rows are file rows: plain text, so their display width is exact.
+            let used: usize = line.iter().map(|(text, _)| text.width()).sum();
+            let pad = " ".repeat(cols.saturating_sub(used));
+            queue!(out, SetAttribute(Attribute::Reverse), Print(pad), SetAttribute(Attribute::Reset))?;
         }
         queue!(out, terminal::Clear(terminal::ClearType::UntilNewLine))?;
     }
-    queue!(out, cursor::MoveTo(0, lines.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    queue!(out, cursor::MoveTo(0, view.lines.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
     out.flush()?;
     Ok(())
 }
@@ -659,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn click_targets_follow_rendered_rows_and_clipping() {
+    fn rows_clicks_selection_and_scrolling_stay_aligned() {
         let root = PathBuf::from("/r/app");
         let change = |code: &[u8; 2], path: &str| Change { code: *code, path: path.into(), orig: None };
         let pr = PrRef { owner: "o".into(), repo: "app".into(), number: 7 };
@@ -686,14 +806,34 @@ mod tests {
             transcript: None,
         });
         // Rows: 0 title, 1 blank, 2 repo header, 3 PR, 4 a.rs, 5 b.rs.
-        let full = render(&model, 40, 20);
-        assert_eq!(full.clicks.get(&3), Some(&Click::Pr { url: pr.url() }));
-        assert_eq!(full.clicks.get(&4), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
-        assert_eq!(full.clicks.get(&5), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
-        assert_eq!(full.clicks.len(), 3);
-        // Five rows: four content rows plus "… more"; the cut-off file rows must not stay clickable.
-        let clipped = render(&model, 40, 5);
-        assert_eq!(clipped.lines.len(), 5);
-        assert_eq!(clipped.clicks.keys().copied().collect::<Vec<_>>(), [3]);
+        let screen = render(&model, 40);
+        assert_eq!(screen.clicks.get(&3), Some(&Click::Pr { url: pr.url() }));
+        assert_eq!(screen.clicks.get(&4), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
+        assert_eq!(screen.clicks.get(&5), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
+        assert_eq!(screen.clicks.len(), 3);
+
+        // Five rows, nothing selected: four content rows plus "… more"; cut-off rows lose clicks.
+        let mut scroll = 0;
+        let view = window(&screen, 40, 5, &mut scroll, None);
+        assert_eq!(view.lines.len(), 5);
+        assert_eq!(view.clicks.keys().copied().collect::<Vec<_>>(), [3]);
+
+        // Arrows walk the files in order and stop at the ends.
+        let selected = |m: &Model| m.selected.as_ref().map(|(_, p)| p.clone());
+        move_selection(&mut model, &screen, 1);
+        assert_eq!(selected(&model).as_deref(), Some("a.rs"));
+        move_selection(&mut model, &screen, 1);
+        move_selection(&mut model, &screen, 1);
+        assert_eq!(selected(&model).as_deref(), Some("b.rs"));
+        assert!(model.diff_due.is_some(), "moving schedules the diff");
+
+        // Selecting the last file scrolls it into view; clicks and highlight follow the scroll.
+        let view = window(&screen, 40, 5, &mut scroll, screen.row_of(model.selected.as_ref()));
+        assert_eq!(scroll, 2);
+        assert_eq!(view.highlight, Some(3));
+        assert_eq!(view.clicks.get(&3), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
+        assert_eq!(view.clicks.get(&1), Some(&Click::Pr { url: pr.url() }));
+        move_selection(&mut model, &screen, -1);
+        assert_eq!(selected(&model).as_deref(), Some("a.rs"));
     }
 }

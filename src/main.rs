@@ -20,10 +20,10 @@ fn main() {
         "pane" => sidebar::run(),
         "diff" => diff::run(),
         "ensure" => dock::ensure(),
-        "toggle" => dock::toggle(),
+        "show" => dock::show(),
         "startup" => dock::startup(),
         _ => {
-            eprintln!("usage: {BIN_NAME} pane|diff|ensure|toggle|startup");
+            eprintln!("usage: {BIN_NAME} pane|diff|ensure|show|startup");
             std::process::exit(2);
         }
     };

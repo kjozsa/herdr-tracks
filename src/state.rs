@@ -24,15 +24,9 @@ fn write_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct TabEntry {
-    pub pane_id: Option<String>,
-    /// The user closed the sidebar in this tab; auto-dock leaves it alone until `toggle`.
-    pub closed: bool,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DockState {
-    pub tabs: BTreeMap<String, TabEntry>,
+    /// Sidebar pane id per tab id.
+    pub tabs: BTreeMap<String, String>,
 }
 
 /// Exclusive hold on the dock state; concurrent hooks serialize on `dock.lock`.
