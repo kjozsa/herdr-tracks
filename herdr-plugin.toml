@@ -1,0 +1,38 @@
+id = "kjozsa.git-sidebar"
+name = "Git Sidebar"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Right-docked pane listing branch and changed files of every git repo the tab's agent session works in."
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# Pane commands start in the pane's cwd, so the binary is addressed via the plugin root.
+[[panes]]
+id = "sidebar"
+title = "git"
+placement = "split"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" pane"]
+
+[[actions]]
+id = "toggle"
+title = "Git Sidebar: toggle"
+contexts = ["workspace", "pane"]
+command = ["target/release/herdr-git-sidebar", "toggle"]
+
+# Auto-dock into tabs that host an agent. Idempotent; skips tabs where the user closed it.
+[[events]]
+on = "pane.agent_detected"
+command = ["target/release/herdr-git-sidebar", "ensure"]
+
+[[events]]
+on = "tab.focused"
+command = ["target/release/herdr-git-sidebar", "ensure"]
+
+[[events]]
+on = "pane.focused"
+command = ["target/release/herdr-git-sidebar", "ensure"]
+
+[[startup]]
+command = ["target/release/herdr-git-sidebar", "startup"]
