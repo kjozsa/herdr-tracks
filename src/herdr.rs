@@ -134,17 +134,26 @@ pub fn pane_close(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Opens the plugin's sidebar entrypoint as a right split of `target_pane_id`, without focus.
-pub fn open_sidebar_pane(plugin_id: &str, target_pane_id: &str) -> Result<String> {
+/// Opens a plugin pane entrypoint as a right split of `target_pane_id` and returns its id.
+/// `env` is added to the pane process's environment.
+pub fn open_plugin_pane(
+    plugin_id: &str,
+    entrypoint: &str,
+    target_pane_id: &str,
+    focus: bool,
+    env: &[(&str, String)],
+) -> Result<String> {
+    let env: serde_json::Map<String, Value> = env.iter().map(|(k, v)| (k.to_string(), Value::from(v.as_str()))).collect();
     let r = call(
         "plugin.pane.open",
         json!({
             "plugin_id": plugin_id,
-            "entrypoint": crate::PANE_ENTRYPOINT,
+            "entrypoint": entrypoint,
             "placement": "split",
             "direction": "right",
             "target_pane_id": target_pane_id,
-            "focus": false,
+            "focus": focus,
+            "env": env,
         }),
     )?;
     r["plugin_pane"]["pane"]["pane_id"]

@@ -7,7 +7,24 @@ use std::process::Command;
 pub struct Change {
     /// Two-letter status code as in porcelain v1, e.g. ` M`, `A `, `??`, `UU`.
     pub code: [u8; 2],
+    /// Path relative to the checkout root.
     pub path: String,
+    /// Previous path of a rename or copy.
+    pub orig: Option<String>,
+}
+
+impl Change {
+    /// `path`, or `orig -> path` for renames.
+    pub fn display(&self) -> String {
+        match &self.orig {
+            Some(orig) => format!("{orig} -> {}", self.path),
+            None => self.path.clone(),
+        }
+    }
+
+    pub fn untracked(&self) -> bool {
+        self.code == *b"??"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,18 +93,18 @@ fn parse_entry(line: &str) -> Option<Change> {
     match kind {
         "1" => {
             let f: Vec<&str> = rest.splitn(8, ' ').collect();
-            Some(Change { code: code(f.first()?), path: f.get(7)?.to_string() })
+            Some(Change { code: code(f.first()?), path: f.get(7)?.to_string(), orig: None })
         }
         "2" => {
             let f: Vec<&str> = rest.splitn(9, ' ').collect();
             let (path, orig) = f.get(8)?.split_once('\t')?;
-            Some(Change { code: code(f.first()?), path: format!("{orig} -> {path}") })
+            Some(Change { code: code(f.first()?), path: path.to_string(), orig: Some(orig.to_string()) })
         }
         "u" => {
             let f: Vec<&str> = rest.splitn(10, ' ').collect();
-            Some(Change { code: code(f.first()?), path: f.get(9)?.to_string() })
+            Some(Change { code: code(f.first()?), path: f.get(9)?.to_string(), orig: None })
         }
-        "?" => Some(Change { code: *b"??", path: rest.to_string() }),
+        "?" => Some(Change { code: *b"??", path: rest.to_string(), orig: None }),
         _ => None,
     }
 }
@@ -118,11 +135,17 @@ mod tests {
              ? notes.md\n"
         ));
         assert_eq!((s.branch.as_str(), s.ahead, s.behind), ("main", 2, 1));
-        let codes: Vec<(&[u8; 2], &str)> = s.changes.iter().map(|c| (&c.code, c.path.as_str())).collect();
+        let codes: Vec<(&[u8; 2], String)> = s.changes.iter().map(|c| (&c.code, c.display())).collect();
         assert_eq!(
             codes,
-            [(b" M", "src/a b.rs"), (b"R ", "old.rs -> new.rs"), (b"UU", "conflict.rs"), (b"??", "notes.md")]
+            [
+                (b" M", "src/a b.rs".to_string()),
+                (b"R ", "old.rs -> new.rs".to_string()),
+                (b"UU", "conflict.rs".to_string()),
+                (b"??", "notes.md".to_string())
+            ]
         );
+        assert_eq!((s.changes[1].path.as_str(), s.changes[1].orig.as_deref()), ("new.rs", Some("old.rs")));
         assert_eq!(parse("# branch.oid (initial)\n# branch.head (detached)\n").branch, "detached");
     }
 

@@ -1,3 +1,4 @@
+mod diff;
 mod dock;
 mod git;
 mod github;
@@ -8,18 +9,21 @@ mod state;
 mod transcript;
 
 pub const PLUGIN_ID: &str = "kjozsa.git-sidebar";
-pub const PANE_ENTRYPOINT: &str = "sidebar";
+/// Manifest `[[panes]]` ids.
+pub const SIDEBAR_ENTRYPOINT: &str = "sidebar";
+pub const DIFF_ENTRYPOINT: &str = "diff";
 pub const BIN_NAME: &str = "herdr-git-sidebar";
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let result = match mode.as_str() {
         "pane" => sidebar::run(),
+        "diff" => diff::run(),
         "ensure" => dock::ensure(),
         "toggle" => dock::toggle(),
         "startup" => dock::startup(),
         _ => {
-            eprintln!("usage: {BIN_NAME} pane|ensure|toggle|startup");
+            eprintln!("usage: {BIN_NAME} pane|diff|ensure|toggle|startup");
             std::process::exit(2);
         }
     };

@@ -2,19 +2,24 @@
 //! session changed (edit/write/commit tool calls in its omp or Claude Code transcript, or a
 //! repo's git state moving after the session first touched it), with branch + changed files.
 
-use crate::git::{self, RepoStatus};
+use crate::diff::DiffRequest;
+use crate::git::{self, Change, RepoStatus};
 use crate::github::{self, Checks, PrRef, PrState, PrStatus};
 use crate::herdr::{self, PaneInfo};
 use crate::repos;
 use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
 use crate::transcript::{Format, Touch, Transcript};
-use anyhow::{anyhow, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use anyhow::{anyhow, Context, Result};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -44,6 +49,23 @@ struct Model {
     pr_errors: HashMap<String, String>,
     /// In-flight PR status refresh (runs `gh` off the UI thread).
     pr_job: Option<Receiver<PrBatch>>,
+    /// Diff pane opened by the last file click; replaced by the next one.
+    diff_pane: Option<String>,
+}
+
+/// What a click on a sidebar row does.
+#[derive(Debug, Clone, PartialEq)]
+enum Click {
+    /// Open the file's diff in a pane next to the agent.
+    File { root: PathBuf, change: Change },
+    /// Open the pull request in the browser.
+    Pr { url: String },
+}
+
+/// Rendered rows plus the click target of each clickable row (by row index).
+struct Screen {
+    lines: Vec<Line>,
+    clicks: HashMap<usize, Click>,
 }
 
 struct PrBatch {
@@ -108,10 +130,10 @@ fn event_loop(me: &str) -> Result<bool> {
             model.pr_job = start_pr_refresh(&model);
         }
         let (cols, rows) = terminal::size()?;
-        let lines = render(&model, usize::from(cols), usize::from(rows));
-        if lines != shown {
-            draw(&lines)?;
-            shown = lines;
+        let screen = render(&model, usize::from(cols), usize::from(rows));
+        if screen.lines != shown {
+            draw(&screen.lines)?;
+            shown = screen.lines;
         }
         let wait = next_sample.min(next_git).saturating_duration_since(Instant::now());
         if event::poll(wait)? {
@@ -122,11 +144,48 @@ fn event_loop(me: &str) -> Result<bool> {
                 {
                     return Ok(true)
                 }
+                Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, .. }) => {
+                    if let Some(click) = screen.clicks.get(&usize::from(row)) {
+                        if let Err(e) = handle_click(&mut model, click) {
+                            model.error = Some(format!("{e:#}"));
+                        }
+                    }
+                }
                 Event::Resize(..) => shown.clear(),
                 _ => {}
             }
         }
     }
+}
+
+fn handle_click(model: &mut Model, click: &Click) -> Result<()> {
+    match click {
+        Click::Pr { url } => {
+            Command::new("xdg-open")
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("xdg-open")?;
+        }
+        Click::File { root, change } => {
+            let agent = model.session.as_ref().map(|s| s.pane_id.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
+            if let Some(previous) = model.diff_pane.take() {
+                let _ = herdr::pane_close(&previous); // already closed by the user is fine
+            }
+            let request = serde_json::to_string(&DiffRequest::new(root, change))?;
+            let pane = herdr::open_plugin_pane(
+                &crate::dock::plugin_id(),
+                crate::DIFF_ENTRYPOINT,
+                &agent,
+                true,
+                &[(crate::diff::ENV, request)],
+            )?;
+            model.diff_pane = Some(pane);
+        }
+    }
+    Ok(())
 }
 
 /// Picks the followed agent pane and records repos under its processes' working dirs.
@@ -347,14 +406,15 @@ enum Tone {
 
 type Line = Vec<(String, Tone)>;
 
-fn render(model: &Model, cols: usize, rows: usize) -> Vec<Line> {
+fn render(model: &Model, cols: usize, rows: usize) -> Screen {
     let mut lines: Vec<Line> = Vec::new();
+    let mut clicks: HashMap<usize, Click> = HashMap::new();
     if let Some(err) = &model.error {
         lines.push(vec![(fit_end(&format!("! {err}"), cols), Tone::Error)]);
     }
     let Some(session) = &model.session else {
         lines.push(vec![(fit_end("no agent in this tab", cols), Tone::Dim)]);
-        return clip(lines, cols, rows);
+        return clip(Screen { lines, clicks }, cols, rows);
     };
     if !session.title.is_empty() {
         lines.push(vec![(fit_end(&session.title, cols), Tone::Dim)]);
@@ -378,6 +438,7 @@ fn render(model: &Model, cols: usize, rows: usize) -> Vec<Line> {
         }
         lines.push(repo_header(root, model.statuses.get(root), cols));
         for pr in session.repos.prs.iter().filter(|p| p.root.as_ref() == Some(root)) {
+            clicks.insert(lines.len(), Click::Pr { url: pr.pr.url() });
             lines.push(pr_line(pr, model.pr_errors.get(&pr.pr.url()), cols));
         }
         match model.statuses.get(root) {
@@ -386,7 +447,8 @@ fn render(model: &Model, cols: usize, rows: usize) -> Vec<Line> {
             Some(Ok(s)) => {
                 for change in &s.changes {
                     let code = String::from_utf8_lossy(&change.code).into_owned();
-                    let path = fit_start(&change.path, cols.saturating_sub(4));
+                    let path = fit_start(&change.display(), cols.saturating_sub(4));
+                    clicks.insert(lines.len(), Click::File { root: root.clone(), change: change.clone() });
                     lines.push(vec![
                         (" ".into(), Tone::Plain),
                         (code, change_tone(change.code)),
@@ -402,9 +464,10 @@ fn render(model: &Model, cols: usize, rows: usize) -> Vec<Line> {
             lines.push(Vec::new());
         }
         lines.push(vec![(fit_end(&format!("{}/{}", pr.pr.owner, pr.pr.repo), cols), Tone::Repo)]);
+        clicks.insert(lines.len(), Click::Pr { url: pr.pr.url() });
         lines.push(pr_line(pr, model.pr_errors.get(&pr.pr.url()), cols));
     }
-    clip(lines, cols, rows)
+    clip(Screen { lines, clicks }, cols, rows)
 }
 
 /// ` #121 open ✓`: number (a link to the PR), state, CI rollup (omitted when the PR has no checks).
@@ -471,14 +534,16 @@ fn change_tone(code: [u8; 2]) -> Tone {
     }
 }
 
-/// Keeps the screen's worth of lines, replacing the overflow with a count.
-fn clip(mut lines: Vec<Line>, cols: usize, rows: usize) -> Vec<Line> {
-    if lines.len() > rows && rows > 0 {
-        let hidden = lines.len() - (rows - 1);
-        lines.truncate(rows - 1);
-        lines.push(vec![(fit_end(&format!("… {hidden} more lines"), cols), Tone::Dim)]);
+/// Keeps the screen's worth of rows, replacing the overflow with a count; rows cut off lose
+/// their click targets.
+fn clip(mut screen: Screen, cols: usize, rows: usize) -> Screen {
+    if screen.lines.len() > rows && rows > 0 {
+        let hidden = screen.lines.len() - (rows - 1);
+        screen.lines.truncate(rows - 1);
+        screen.clicks.retain(|row, _| *row < rows - 1);
+        screen.lines.push(vec![(fit_end(&format!("… {hidden} more lines"), cols), Tone::Dim)]);
     }
-    lines
+    screen
 }
 
 /// Truncates keeping the start: `long-branch-na…`.
@@ -560,14 +625,14 @@ struct Term;
 impl Term {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+        crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
         Ok(Term)
     }
 }
 
 impl Drop for Term {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -591,5 +656,44 @@ mod tests {
         assert_eq!(change_tone(*b"MM"), Tone::Unstaged);
         assert_eq!(change_tone(*b"??"), Tone::Untracked);
         assert_eq!(change_tone(*b"UU"), Tone::Conflict);
+    }
+
+    #[test]
+    fn click_targets_follow_rendered_rows_and_clipping() {
+        let root = PathBuf::from("/r/app");
+        let change = |code: &[u8; 2], path: &str| Change { code: *code, path: path.into(), orig: None };
+        let pr = PrRef { owner: "o".into(), repo: "app".into(), number: 7 };
+        let mut model = Model::default();
+        model.statuses.insert(
+            root.clone(),
+            Ok(RepoStatus {
+                branch: "main".into(),
+                ahead: 0,
+                behind: 0,
+                changes: vec![change(b" M", "a.rs"), change(b"??", "b.rs")],
+                fingerprint: 0,
+            }),
+        );
+        model.session = Some(Session {
+            pane_id: "w:p1".into(),
+            title: "chat".into(),
+            repos: SessionRepos {
+                session: "s".into(),
+                repos: vec![RepoRecord { root: root.clone(), changed: true, baseline: None }],
+                prs: vec![PrRecord { pr: pr.clone(), root: Some(root.clone()), status: None }],
+            },
+            persisted: false,
+            transcript: None,
+        });
+        // Rows: 0 title, 1 blank, 2 repo header, 3 PR, 4 a.rs, 5 b.rs.
+        let full = render(&model, 40, 20);
+        assert_eq!(full.clicks.get(&3), Some(&Click::Pr { url: pr.url() }));
+        assert_eq!(full.clicks.get(&4), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
+        assert_eq!(full.clicks.get(&5), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
+        assert_eq!(full.clicks.len(), 3);
+        // Five rows: four content rows plus "… more"; the cut-off file rows must not stay clickable.
+        let clipped = render(&model, 40, 5);
+        assert_eq!(clipped.lines.len(), 5);
+        assert_eq!(clipped.clicks.keys().copied().collect::<Vec<_>>(), [3]);
     }
 }

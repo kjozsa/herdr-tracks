@@ -15,7 +15,7 @@ const MIN_MAIN_WIDTH: u32 = 40;
 /// herdr clamps split ratios to 0.1..=0.9.
 const MAX_RATIO: f64 = 0.9;
 
-fn plugin_id() -> String {
+pub fn plugin_id() -> String {
     std::env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| crate::PLUGIN_ID.to_string())
 }
 
@@ -141,7 +141,7 @@ fn dock(tab_panes: &[&PaneInfo]) -> Result<Option<String>> {
         return Ok(None);
     }
     let target = dock_target(&layout)?;
-    let pane = herdr::open_sidebar_pane(&plugin_id(), &target)?;
+    let pane = herdr::open_plugin_pane(&plugin_id(), crate::SIDEBAR_ENTRYPOINT, &target, false, &[])?;
     if let Err(e) = snap_width(&pane, width) {
         eprintln!("sizing {pane}: {e:#}");
     }

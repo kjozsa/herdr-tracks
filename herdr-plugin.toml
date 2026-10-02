@@ -15,6 +15,13 @@ title = "git"
 placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" pane"]
 
+# Opened by clicking a changed file in the sidebar; closes itself when the pager quits.
+[[panes]]
+id = "diff"
+title = "diff"
+placement = "split"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" diff"]
+
 [[actions]]
 id = "toggle"
 title = "Git Sidebar: toggle"
