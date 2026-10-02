@@ -1,13 +1,13 @@
 //! The sidebar pane: follows one agent chat session in its tab and lists the git repos that
-//! session changed (omp edit/write/commit tool calls, or a repo's git state moving after the
-//! session first touched it), with branch + changed files for each.
+//! session changed (edit/write/commit tool calls in its omp or Claude Code transcript, or a
+//! repo's git state moving after the session first touched it), with branch + changed files.
 
 use crate::git::{self, RepoStatus};
 use crate::github::{self, Checks, PrRef, PrState, PrStatus};
 use crate::herdr::{self, PaneInfo};
 use crate::repos;
 use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
-use crate::transcript::{Touch, Transcript};
+use crate::transcript::{Format, Touch, Transcript};
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
@@ -29,7 +29,7 @@ struct Session {
     title: String,
     repos: SessionRepos,
     persisted: bool,
-    /// omp transcript being tailed; other agents rely on process working dirs only.
+    /// Transcript being tailed (omp, Claude Code); other agents rely on process working dirs only.
     transcript: Option<Transcript>,
 }
 
@@ -167,19 +167,19 @@ fn sample(me: &str, model: &mut Model) -> Result<bool> {
             } else {
                 SessionRepos { session: key, ..SessionRepos::default() }
             };
+            let fallback_cwd = target.cwd.clone().map(PathBuf::from).unwrap_or_default();
             let transcript = target
-                .agent_session
-                .as_ref()
-                .filter(|_| target.agent.as_deref() == Some("omp"))
-                .map(|s| PathBuf::from(&s.value))
-                .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-                .map(|p| Transcript::new(p, target.cwd.clone().map(PathBuf::from).unwrap_or_default()));
+                .agent
+                .as_deref()
+                .and_then(Format::of_agent)
+                .zip(target.agent_session.as_ref())
+                .map(|(format, s)| Transcript::new(format, s.value.clone(), fallback_cwd));
             slot.insert(Session { pane_id: target.pane_id.clone(), title, repos, persisted, transcript })
         }
     };
 
     // Transcript first: on attach it replays the whole chat in order, so repos keep
-    // first-touch order. A transcript omp has not written yet just yields nothing.
+    // first-touch order. A transcript the agent has not written yet just yields nothing.
     let activity = session.transcript.as_mut().and_then(|t| t.poll().ok()).unwrap_or_default();
     let mut touches = activity.touches;
     let mut observed: Vec<PathBuf> =
