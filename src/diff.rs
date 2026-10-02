@@ -1,20 +1,20 @@
-//! The diff pane: a small viewer for `git diff` of the file selected in the sidebar. The
-//! sidebar names the file in a request file and the viewer redraws when it changes, so browsing
-//! files swaps the content in place instead of opening a new pane per file.
+//! The diff pane: a small viewer for the diff selected in the sidebar, either a changed local
+//! file or (part of) a pull request. The sidebar names it in a request file and the viewer
+//! redraws when that changes, so browsing swaps the content in place instead of opening panes.
 
 use crate::git::Change;
-use crate::herdr;
 use crate::term::Term;
+use crate::{ansi, github, herdr};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use crossterm::style::Print;
 use crossterm::{cursor, queue, terminal};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthChar;
 
 /// Environment variable naming the request file the viewer follows.
 pub const ENV: &str = "TRACKS_DIFF_FILE";
@@ -24,19 +24,27 @@ pub const OWNER_ENV: &str = "TRACKS_DIFF_OWNER";
 const POLL: Duration = Duration::from_millis(50);
 /// How often the viewer checks that its sidebar still exists.
 const OWNER_CHECK: Duration = Duration::from_secs(1);
+/// How long a fetched pull-request patch is reused before fetching it again.
+const PR_PATCH_TTL: Duration = Duration::from_secs(30);
 const WHEEL_LINES: usize = 3;
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct DiffRequest {
-    pub root: PathBuf,
-    pub path: String,
-    pub orig: Option<String>,
-    pub untracked: bool,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffRequest {
+    /// A changed file in a local checkout: staged and unstaged changes together.
+    Local { root: PathBuf, path: String, orig: Option<String>, untracked: bool },
+    /// A pull request's patch: one file of it, or all of it.
+    Pr { url: String, path: Option<String> },
 }
 
 impl DiffRequest {
-    pub fn new(root: &Path, change: &Change) -> Self {
-        Self { root: root.to_path_buf(), path: change.path.clone(), orig: change.orig.clone(), untracked: change.untracked() }
+    pub fn local(root: &Path, change: &Change) -> Self {
+        DiffRequest::Local {
+            root: root.to_path_buf(),
+            path: change.path.clone(),
+            orig: change.orig.clone(),
+            untracked: change.untracked(),
+        }
     }
 }
 
@@ -69,12 +77,16 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Fetched pull-request patches by URL, with when they were fetched.
+type PrPatches = HashMap<String, (Instant, Result<String, String>)>;
+
 /// Shows the requested diff until `q`/`Esc`, re-rendering when the request or width changes.
 /// Also ends once `owner` (the sidebar pane) is gone: nothing would point the viewer anywhere.
 fn view(file: &Path, owner: Option<&str>) -> Result<()> {
     let mut request_text = String::new();
     let mut rendered: Option<(String, u16)> = None;
     let mut lines: Vec<String> = Vec::new();
+    let mut patches = PrPatches::new();
     let mut scroll = 0usize;
     let mut dirty = true;
     let mut next_owner_check = Instant::now() + OWNER_CHECK;
@@ -88,7 +100,7 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
         }
         if rendered.as_ref() != Some(&(request_text.clone(), cols)) {
             lines = match serde_json::from_str::<DiffRequest>(&request_text) {
-                Ok(request) => diff_lines(&request, cols),
+                Ok(request) => diff_lines(&request, cols, &mut patches),
                 Err(_) => vec!["waiting for a file…".into()],
             };
             rendered = Some((request_text.clone(), cols));
@@ -130,31 +142,62 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
     }
 }
 
-/// `git diff` for the request, formatted by the user's pager when it is delta, as ANSI lines.
-fn diff_lines(request: &DiffRequest, cols: u16) -> Vec<String> {
-    let git = |args: &[&str]| Command::new("git").arg("-C").arg(&request.root).args(args).stdin(Stdio::null()).output();
-    let has_head = git(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok_and(|o| o.status.success());
-    let args = diff_args(request, has_head);
-    let diff = match git(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
-        Ok(out) if out.stdout.is_empty() && !out.status.success() && !request.untracked => {
-            return vec![String::from_utf8_lossy(&out.stderr).trim().to_string()];
-        }
-        Ok(out) => out.stdout,
-        Err(e) => return vec![format!("git: {e}")],
+/// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
+fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut PrPatches) -> Vec<String> {
+    let (patch, repo) = match request {
+        DiffRequest::Local { root, .. } => (local_patch(request, root), Some(root.as_path())),
+        DiffRequest::Pr { url, path } => (pr_patch(patches, url, path.as_deref()), None),
     };
-    if diff.is_empty() {
-        return vec!["no changes".into()];
-    }
-    let pager = git(&["config", "--get", "core.pager"])
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|p| p.contains("delta"));
-    let formatted = pager.and_then(|pager| through_delta(&pager, &diff, cols)).unwrap_or(diff);
-    String::from_utf8_lossy(&formatted).lines().map(|l| l.replace('\t', "    ")).collect()
+    let patch = match patch {
+        Ok(patch) if patch.trim().is_empty() => return vec!["no changes".into()],
+        Ok(patch) => patch,
+        Err(e) => return vec![e],
+    };
+    let formatted = match delta_pager(repo) {
+        Some(pager) => through_delta(&pager, &patch, cols).unwrap_or_else(|| colorize(&patch)),
+        None => colorize(&patch),
+    };
+    formatted.lines().map(|l| l.replace('\t', "    ")).collect()
 }
 
-/// Runs `diff` through the configured delta command at the pane's width, without paging.
-fn through_delta(pager: &str, diff: &[u8], cols: u16) -> Option<Vec<u8>> {
+fn local_patch(request: &DiffRequest, root: &Path) -> Result<String, String> {
+    let git = |args: &[&str]| Command::new("git").arg("-C").arg(root).args(args).stdin(Stdio::null()).output();
+    let has_head = git(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok_and(|o| o.status.success());
+    let args = diff_args(request, has_head);
+    let out = git(&args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| format!("git: {e}"))?;
+    let untracked = matches!(request, DiffRequest::Local { untracked: true, .. });
+    // `--no-index` exits 1 when the files differ; other failures leave stdout empty.
+    if out.stdout.is_empty() && !out.status.success() && !untracked {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The pull request's patch, or one file of it; fetched once per [`PR_PATCH_TTL`].
+fn pr_patch(patches: &mut PrPatches, url: &str, path: Option<&str>) -> Result<String, String> {
+    let fresh = patches.get(url).is_some_and(|(at, _)| at.elapsed() < PR_PATCH_TTL);
+    if !fresh {
+        patches.insert(url.to_string(), (Instant::now(), github::pr_diff(url)));
+    }
+    let patch = patches[url].1.as_ref().map_err(String::clone)?;
+    match path {
+        None => Ok(patch.clone()),
+        Some(path) => github::patch_section(patch, path).map(str::to_string).ok_or_else(|| format!("{path} is not in this PR")),
+    }
+}
+
+/// The user's `core.pager` (as seen from `repo`) when it is delta.
+fn delta_pager(repo: Option<&Path>) -> Option<String> {
+    let mut git = Command::new("git");
+    if let Some(repo) = repo {
+        git.arg("-C").arg(repo);
+    }
+    let out = git.args(["config", "--get", "core.pager"]).stdin(Stdio::null()).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|p| p.contains("delta"))
+}
+
+/// Runs `patch` through the configured delta command at the pane's width, without paging.
+fn through_delta(pager: &str, patch: &str, cols: u16) -> Option<String> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!("{pager} --width={cols} --paging=never"))
@@ -166,24 +209,50 @@ fn through_delta(pager: &str, diff: &[u8], cols: u16) -> Option<Vec<u8>> {
         .spawn()
         .ok()?;
     let mut stdin = child.stdin.take()?;
-    let input = diff.to_vec();
+    let input = patch.as_bytes().to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&input));
     let out = child.wait_with_output().ok()?;
     let _ = writer.join();
-    out.status.success().then_some(out.stdout)
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Plain git-style colours for a unified diff, when delta is not in use.
+fn colorize(patch: &str) -> String {
+    let mut out = String::with_capacity(patch.len() + patch.len() / 4);
+    for line in patch.lines() {
+        let colour = if line.starts_with("diff --git") || line.starts_with("+++") || line.starts_with("---") {
+            "1"
+        } else if line.starts_with("@@") {
+            "36"
+        } else if line.starts_with('+') {
+            "32"
+        } else if line.starts_with('-') {
+            "31"
+        } else {
+            ""
+        };
+        if colour.is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(&format!("\x1b[{colour}m{line}\x1b[0m"));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Staged and unstaged changes together (`git diff HEAD`); untracked files as all-new.
 fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
-    let mut args: Vec<String> = vec!["diff".into(), "--color=always".into()];
-    if request.untracked {
+    let DiffRequest::Local { path, orig, untracked, .. } = request else { return Vec::new() };
+    let mut args: Vec<String> = vec!["diff".into(), "--color=never".into()];
+    if *untracked {
         args.extend(["--no-index", "--", "/dev/null"].map(String::from));
     } else {
         // Before the first commit there is no HEAD: show what is staged.
         args.extend([if has_head { "HEAD" } else { "--cached" }, "-M", "--"].map(String::from));
-        args.extend(request.orig.clone());
+        args.extend(orig.clone());
     }
-    args.push(request.path.clone());
+    args.push(path.clone());
     args
 }
 
@@ -192,7 +261,7 @@ fn draw(lines: &[String], cols: u16, rows: u16) -> Result<()> {
     for row in 0..rows {
         queue!(out, cursor::MoveTo(0, row))?;
         if let Some(line) = lines.get(usize::from(row)) {
-            queue!(out, Print(fit_ansi(line, usize::from(cols))))?;
+            queue!(out, Print(ansi::fit(line, usize::from(cols))))?;
         }
         queue!(out, Print("\x1b[0m"), terminal::Clear(terminal::ClearType::UntilNewLine))?;
     }
@@ -200,77 +269,29 @@ fn draw(lines: &[String], cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-/// Cuts an ANSI-coloured line to `cols` display columns, keeping escape sequences intact.
-fn fit_ansi(line: &str, cols: usize) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut used = 0;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            out.push(c);
-            match chars.next() {
-                // CSI: parameters up to a final byte in @..~.
-                Some('[') => {
-                    out.push('[');
-                    for c in chars.by_ref() {
-                        out.push(c);
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: up to BEL or ESC \.
-                Some(']') => {
-                    out.push(']');
-                    while let Some(c) = chars.next() {
-                        out.push(c);
-                        if c == '\x07' || (c == '\x1b' && chars.peek() == Some(&'\\')) {
-                            if c == '\x1b' {
-                                out.push(chars.next().unwrap_or('\\'));
-                            }
-                            break;
-                        }
-                    }
-                }
-                Some(other) => out.push(other),
-                None => {}
-            }
-            continue;
-        }
-        let w = c.width().unwrap_or(0);
-        if used + w > cols {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn request(path: &str, orig: Option<&str>, untracked: bool) -> DiffRequest {
-        DiffRequest { root: "/r".into(), path: path.into(), orig: orig.map(String::from), untracked }
+    fn local(path: &str, orig: Option<&str>, untracked: bool) -> DiffRequest {
+        DiffRequest::Local { root: "/r".into(), path: path.into(), orig: orig.map(String::from), untracked }
     }
 
     #[test]
     fn diff_args_cover_tracked_renamed_untracked_and_unborn() {
         let args = |r: &DiffRequest, head: bool| diff_args(r, head)[2..].to_vec();
-        assert_eq!(args(&request("a.rs", None, false), true), ["HEAD", "-M", "--", "a.rs"]);
-        assert_eq!(args(&request("new.rs", Some("old.rs"), false), true), ["HEAD", "-M", "--", "old.rs", "new.rs"]);
-        assert_eq!(args(&request("n.md", None, true), true), ["--no-index", "--", "/dev/null", "n.md"]);
-        assert_eq!(args(&request("a.rs", None, false), false), ["--cached", "-M", "--", "a.rs"]);
-        assert_eq!(diff_args(&request("a.rs", None, false), true)[..2], ["diff", "--color=always"]);
+        assert_eq!(args(&local("a.rs", None, false), true), ["HEAD", "-M", "--", "a.rs"]);
+        assert_eq!(args(&local("new.rs", Some("old.rs"), false), true), ["HEAD", "-M", "--", "old.rs", "new.rs"]);
+        assert_eq!(args(&local("n.md", None, true), true), ["--no-index", "--", "/dev/null", "n.md"]);
+        assert_eq!(args(&local("a.rs", None, false), false), ["--cached", "-M", "--", "a.rs"]);
     }
 
     #[test]
-    fn fit_ansi_counts_only_visible_columns() {
-        let red = "\x1b[38;2;255;0;0m";
-        assert_eq!(fit_ansi(&format!("{red}abcdef\x1b[0m"), 3), format!("{red}abc"));
-        assert_eq!(fit_ansi("日本語", 5), "日本");
-        assert_eq!(fit_ansi("\x1b]8;;https://x\x1b\\ab\x1b]8;;\x1b\\", 1), "\x1b]8;;https://x\x1b\\a");
-        assert_eq!(fit_ansi("short", 80), "short");
+    fn colorize_marks_headers_hunks_and_changed_lines() {
+        let out = colorize("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n same\n");
+        assert_eq!(
+            out,
+            "\x1b[1mdiff --git a/x b/x\x1b[0m\n\x1b[36m@@ -1 +1 @@\x1b[0m\n\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[0m\n same\n"
+        );
     }
 }

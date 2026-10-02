@@ -23,6 +23,11 @@ impl PrRef {
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.repo).to_lowercase()
     }
+
+    /// The same pull request, whatever the letter case of owner and repo (GitHub ignores it).
+    pub fn same(&self, other: &PrRef) -> bool {
+        self.number == other.number && self.slug() == other.slug()
+    }
 }
 
 /// Every PR URL in `text`. `…/pull/new/<branch>` (the hint `git push` prints) is not a PR.
@@ -50,7 +55,8 @@ pub fn pr_urls(text: &str) -> Vec<PrRef> {
     found
 }
 
-/// `owner/repo` (lowercased) of every github.com remote of the checkout at `root`.
+/// `owner/repo` (lowercased) of every github.com remote of the checkout at `root`. The first
+/// is the repo `gh` would default to: remotes named `upstream`, `github`, `origin`, then others.
 pub fn remote_slugs(root: &Path) -> Vec<String> {
     let Ok(out) = Command::new("git")
         .arg("-C")
@@ -60,7 +66,17 @@ pub fn remote_slugs(root: &Path) -> Vec<String> {
     else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_whitespace().nth(1)).filter_map(remote_slug).collect()
+    let rank = |key: &str| {
+        let name = key.strip_prefix("remote.").and_then(|k| k.strip_suffix(".url")).unwrap_or(key);
+        ["upstream", "github", "origin"].iter().position(|n| *n == name).unwrap_or(3)
+    };
+    let mut remotes: Vec<(usize, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(key, url)| Some((rank(key), remote_slug(url.trim())?)))
+        .collect();
+    remotes.sort_by_key(|(rank, _)| *rank);
+    remotes.into_iter().map(|(_, slug)| slug).collect()
 }
 
 /// `git@github.com:o/r.git`, `https://github.com/o/r`, `ssh://git@github.com/o/r.git` → `o/r`.
@@ -102,15 +118,8 @@ pub struct PrStatus {
 }
 
 pub fn pr_status(pr: &PrRef) -> Result<PrStatus, String> {
-    let out = Command::new("gh")
-        .args(["pr", "view", &pr.url(), "--json", "state,isDraft,statusCheckRollup"])
-        .output()
-        .map_err(|e| format!("gh: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err.lines().next().unwrap_or("gh pr view failed").to_string());
-    }
-    let json: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("gh output: {e}"))?;
+    let json = gh(&["pr", "view", &pr.url(), "--json", "state,isDraft,statusCheckRollup"])?;
+    let json: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
     Ok(parse_status(&json))
 }
 
@@ -143,6 +152,62 @@ fn rollup(checks: &[Value]) -> Option<Checks> {
         });
     }
     result
+}
+
+/// One file of a pull request, as `gh pr view --json files` reports it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PrFile {
+    pub path: String,
+    #[serde(rename = "changeType", default)]
+    pub change_type: String,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+}
+
+impl PrFile {
+    /// Status letter in the style of `git status`: `A`, `D`, `R`, `C` or `M`.
+    pub fn code(&self) -> char {
+        match self.change_type.as_str() {
+            "ADDED" => 'A',
+            "DELETED" => 'D',
+            "RENAMED" => 'R',
+            "COPIED" => 'C',
+            _ => 'M',
+        }
+    }
+}
+
+pub fn pr_files(url: &str) -> Result<Vec<PrFile>, String> {
+    let json = gh(&["pr", "view", url, "--json", "files"])?;
+    let mut value: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
+    serde_json::from_value(value["files"].take()).map_err(|e| format!("gh files: {e}"))
+}
+
+/// The pull request's whole patch.
+pub fn pr_diff(url: &str) -> Result<String, String> {
+    gh(&["pr", "diff", url, "--color=never"])
+}
+
+fn gh(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("gh").args(args).output().map_err(|e| format!("gh: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().next().unwrap_or("gh failed").to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The part of a multi-file patch for `path` (the new path of a rename): from its
+/// `diff --git a/… b/<path>` header up to the next file's header.
+pub fn patch_section<'a>(patch: &'a str, path: &str) -> Option<&'a str> {
+    let headers: Vec<usize> = patch.match_indices("diff --git ").filter(|(i, _)| *i == 0 || patch[..*i].ends_with('\n')).map(|(i, _)| i).collect();
+    headers.iter().enumerate().find_map(|(n, &start)| {
+        let header = patch[start..].lines().next()?;
+        let (_, b) = header.rsplit_once(" b/")?;
+        (b == path).then(|| &patch[start..headers.get(n + 1).copied().unwrap_or(patch.len())])
+    })
 }
 
 #[cfg(test)]
@@ -178,5 +243,16 @@ mod tests {
         assert_eq!(checks(json!([run("IN_PROGRESS", ""), run("COMPLETED", "FAILURE")])), Some(Checks::Failing));
         assert_eq!(checks(json!([{"state": "PENDING"}, {"state": "SUCCESS"}])), Some(Checks::Pending));
         assert_eq!(checks(json!([{"state": "ERROR"}])), Some(Checks::Failing));
+    }
+
+    #[test]
+    fn patch_section_cuts_one_file_including_renames() {
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                     diff --git a/old name.rs b/new name.rs\nsimilarity index 90%\n\
+                     diff --git a/c.rs b/c.rs\n+mentions diff --git a/zz b/zz inline\n";
+        assert_eq!(patch_section(patch, "a.rs"), Some("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n"));
+        assert_eq!(patch_section(patch, "new name.rs"), Some("diff --git a/old name.rs b/new name.rs\nsimilarity index 90%\n"));
+        assert_eq!(patch_section(patch, "c.rs"), Some("diff --git a/c.rs b/c.rs\n+mentions diff --git a/zz b/zz inline\n"));
+        assert_eq!(patch_section(patch, "zz"), None, "only headers at line starts count");
     }
 }

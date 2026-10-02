@@ -1,7 +1,11 @@
-//! `git status --porcelain=v2 --branch` for one checkout.
+//! `git status --porcelain=v2 --branch` for one checkout, with per-file line counts.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+
+/// Untracked files larger than this are not read to count their lines.
+const COUNT_LIMIT: u64 = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -11,6 +15,15 @@ pub struct Change {
     pub path: String,
     /// Previous path of a rename or copy.
     pub orig: Option<String>,
+    /// Lines added and removed against HEAD (staged and unstaged together).
+    pub stat: Option<LineStat>,
+}
+
+/// Lines a change adds and removes, as `git diff --numstat` counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineStat {
+    Lines { added: u32, removed: u32 },
+    Binary,
 }
 
 impl Change {
@@ -50,7 +63,85 @@ pub fn status(root: &Path) -> Result<RepoStatus, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err.lines().next().unwrap_or("git status failed").to_string());
     }
-    Ok(parse(&String::from_utf8_lossy(&out.stdout)))
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut status = parse(&text);
+    let stats = numstat(root, text.contains("# branch.oid (initial)"));
+    for change in &mut status.changes {
+        change.stat = if change.untracked() { count_lines(&root.join(&change.path)) } else { stats.get(&change.path).copied() };
+    }
+    Ok(status)
+}
+
+/// Line counts of every changed tracked file against HEAD; before the first commit, staged
+/// plus unstaged changes.
+fn numstat(root: &Path, unborn: bool) -> HashMap<String, LineStat> {
+    let run = |args: &[&str]| {
+        Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "core.quotePath=false", "diff", "--numstat", "-z", "-M"])
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    if !unborn {
+        return parse_numstat(&run(&["HEAD"]));
+    }
+    let mut stats = parse_numstat(&run(&["--cached"]));
+    for (path, stat) in parse_numstat(&run(&[])) {
+        let merged = match (stats.get(&path), stat) {
+            (Some(LineStat::Lines { added: a, removed: r }), LineStat::Lines { added, removed }) => {
+                LineStat::Lines { added: a + added, removed: r + removed }
+            }
+            (Some(_), _) => LineStat::Binary,
+            (None, stat) => stat,
+        };
+        stats.insert(path, merged);
+    }
+    stats
+}
+
+/// `git diff --numstat -z`: `added\tremoved\tpath\0`, or `added\tremoved\t\0old\0new\0` for
+/// renames; binary files report `-` for both counts.
+fn parse_numstat(text: &str) -> HashMap<String, LineStat> {
+    let mut stats = HashMap::new();
+    let mut tokens = text.split('\0');
+    while let Some(record) = tokens.next() {
+        let mut fields = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (fields.next(), fields.next(), fields.next()) else { continue };
+        let path = if path.is_empty() {
+            tokens.next(); // previous path
+            match tokens.next() {
+                Some(new) => new,
+                None => continue,
+            }
+        } else {
+            path
+        };
+        let stat = match (added.parse(), removed.parse()) {
+            (Ok(added), Ok(removed)) => LineStat::Lines { added, removed },
+            _ => LineStat::Binary,
+        };
+        stats.insert(path.to_string(), stat);
+    }
+    stats
+}
+
+/// An untracked file counts as all lines added; `None` for directories and very large files.
+fn count_lines(path: &Path) -> Option<LineStat> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > COUNT_LIMIT {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return Some(LineStat::Binary);
+    }
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+    let unterminated = usize::from(bytes.last().is_some_and(|b| *b != b'\n'));
+    Some(LineStat::Lines { added: u32::try_from(newlines + unterminated).unwrap_or(u32::MAX), removed: 0 })
 }
 
 fn parse(text: &str) -> RepoStatus {
@@ -93,18 +184,18 @@ fn parse_entry(line: &str) -> Option<Change> {
     match kind {
         "1" => {
             let f: Vec<&str> = rest.splitn(8, ' ').collect();
-            Some(Change { code: code(f.first()?), path: f.get(7)?.to_string(), orig: None })
+            Some(Change { code: code(f.first()?), path: f.get(7)?.to_string(), orig: None, stat: None })
         }
         "2" => {
             let f: Vec<&str> = rest.splitn(9, ' ').collect();
             let (path, orig) = f.get(8)?.split_once('\t')?;
-            Some(Change { code: code(f.first()?), path: path.to_string(), orig: Some(orig.to_string()) })
+            Some(Change { code: code(f.first()?), path: path.to_string(), orig: Some(orig.to_string()), stat: None })
         }
         "u" => {
             let f: Vec<&str> = rest.splitn(10, ' ').collect();
-            Some(Change { code: code(f.first()?), path: f.get(9)?.to_string(), orig: None })
+            Some(Change { code: code(f.first()?), path: f.get(9)?.to_string(), orig: None, stat: None })
         }
-        "?" => Some(Change { code: *b"??", path: rest.to_string(), orig: None }),
+        "?" => Some(Change { code: *b"??", path: rest.to_string(), orig: None, stat: None }),
         _ => None,
     }
 }
@@ -158,5 +249,14 @@ mod tests {
         assert_ne!(clean, fp(&format!("{BASE}? scratch.txt\n")), "new untracked file");
         let staged = |blob: &str| fp(&format!("{BASE}1 M. N... 100644 100644 100644 aaa {blob} a.rs\n"));
         assert_ne!(staged("bbb"), staged("ccc"), "re-staged content");
+    }
+
+    #[test]
+    fn numstat_reads_counts_renames_and_binaries() {
+        let stats = parse_numstat(concat!("3\t1\tsrc/a b.rs\0", "10\t0\t\0old.rs\0new.rs\0", "-\t-\tlogo.png\0"));
+        assert_eq!(stats.get("src/a b.rs"), Some(&LineStat::Lines { added: 3, removed: 1 }));
+        assert_eq!(stats.get("new.rs"), Some(&LineStat::Lines { added: 10, removed: 0 }), "renames key by new path");
+        assert_eq!(stats.get("old.rs"), None);
+        assert_eq!(stats.get("logo.png"), Some(&LineStat::Binary));
     }
 }

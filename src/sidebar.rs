@@ -3,17 +3,17 @@
 //! repo's git state moving after the session first touched it), with branch + changed files.
 
 use crate::diff::{self, DiffRequest};
-use crate::git::{self, Change, RepoStatus};
-use crate::github::{self, Checks, PrRef, PrState, PrStatus};
+use crate::git::{self, Change, LineStat, RepoStatus};
+use crate::github::{self, Checks, PrFile, PrRef, PrState, PrStatus};
 use crate::herdr::{self, PaneInfo};
 use crate::repos;
 use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
 use crate::transcript::{Format, Touch, Transcript};
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -48,21 +48,55 @@ struct Model {
     pr_job: Option<Receiver<PrBatch>>,
     /// The diff pane currently shown; the next diff replaces it.
     diff_pane: Option<String>,
-    /// File chosen with the arrow keys or a click, as (checkout root, path); its diff is shown.
-    selected: Option<(PathBuf, String)>,
+    /// Row chosen with the arrow keys or a click; its diff is shown.
+    selected: Option<Key>,
+    /// Pull requests expanded to list their files, by URL.
+    expanded: HashSet<String>,
+    /// Files of expanded pull requests, by URL; absent while loading.
+    pr_files: HashMap<String, Result<Vec<PrFile>, String>>,
+    /// In-flight file list fetches (run `gh` off the UI thread).
+    files_jobs: Vec<Receiver<(String, Result<Vec<PrFile>, String>)>>,
     /// This sidebar's own pane id; names the request file its diff viewer follows.
     me: String,
     /// First rendered row on screen when the list is taller than the pane.
     scroll: usize,
 }
 
-/// What a click on a sidebar row does.
+/// What a sidebar row is: selecting or clicking it shows its diff.
 #[derive(Debug, Clone, PartialEq)]
 enum Click {
-    /// Open the file's diff in a pane next to the agent.
+    /// A changed file in a local checkout.
     File { root: PathBuf, change: Change },
-    /// Open the pull request in the browser.
+    /// A pull request; expands to its files.
     Pr { url: String },
+    /// One file of an expanded pull request.
+    PrFile { url: String, path: String },
+}
+
+/// Identity of a selectable row that survives refreshes (a file's status code may change).
+#[derive(Debug, Clone, PartialEq)]
+enum Key {
+    File(PathBuf, String),
+    Pr(String),
+    PrFile(String, String),
+}
+
+impl Click {
+    fn key(&self) -> Key {
+        match self {
+            Click::File { root, change } => Key::File(root.clone(), change.path.clone()),
+            Click::Pr { url } => Key::Pr(url.clone()),
+            Click::PrFile { url, path } => Key::PrFile(url.clone(), path.clone()),
+        }
+    }
+
+    fn diff_request(&self) -> DiffRequest {
+        match self {
+            Click::File { root, change } => DiffRequest::local(root, change),
+            Click::Pr { url } => DiffRequest::Pr { url: url.clone(), path: None },
+            Click::PrFile { url, path } => DiffRequest::Pr { url: url.clone(), path: Some(path.clone()) },
+        }
+    }
 }
 
 /// All rendered rows plus the click target of each clickable row (by row index).
@@ -72,23 +106,16 @@ struct Screen {
 }
 
 impl Screen {
-    /// Changed files in display order, as (row, checkout root, change).
-    fn files(&self) -> Vec<(usize, &PathBuf, &Change)> {
-        let mut files: Vec<_> = self
-            .clicks
-            .iter()
-            .filter_map(|(row, click)| match click {
-                Click::File { root, change } => Some((*row, root, change)),
-                Click::Pr { .. } => None,
-            })
-            .collect();
-        files.sort_by_key(|(row, ..)| *row);
-        files
+    /// Selectable rows in display order.
+    fn rows(&self) -> Vec<(usize, &Click)> {
+        let mut rows: Vec<_> = self.clicks.iter().map(|(row, click)| (*row, click)).collect();
+        rows.sort_by_key(|(row, _)| *row);
+        rows
     }
 
-    fn row_of(&self, selected: Option<&(PathBuf, String)>) -> Option<usize> {
-        let (root, path) = selected?;
-        self.files().into_iter().find(|(_, r, c)| *r == root && c.path == *path).map(|(row, ..)| row)
+    fn row_of(&self, key: Option<&Key>) -> Option<usize> {
+        let key = key?;
+        self.clicks.iter().find(|(_, click)| click.key() == *key).map(|(row, _)| *row)
     }
 }
 
@@ -162,28 +189,21 @@ fn event_loop(me: &str) -> Result<()> {
             draw(&view, usize::from(cols))?;
             shown = (view.lines.clone(), view.highlight);
         }
+        let Model { files_jobs, pr_files, .. } = &mut model;
+        files_jobs.retain(|job| match job.try_recv() {
+            Ok((url, files)) => {
+                pr_files.insert(url, files);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
         if event::poll(next_sample.min(next_git).saturating_duration_since(Instant::now()))? {
             let result = match event::read()? {
-                Event::Key(KeyEvent { code: KeyCode::Down | KeyCode::Char('j'), .. }) => {
-                    if move_selection(&mut model, &screen, 1) { show_selected_diff(&mut model) } else { Ok(()) }
-                }
-                Event::Key(KeyEvent { code: KeyCode::Up | KeyCode::Char('k'), .. }) => {
-                    if move_selection(&mut model, &screen, -1) { show_selected_diff(&mut model) } else { Ok(()) }
-                }
-                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => match &model.diff_pane {
-                    Some(pane) => herdr::pane_focus(pane),
-                    None => Ok(()),
-                },
-                Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
-                    model.selected = None;
-                    match model.diff_pane.take() {
-                        Some(pane) => herdr::pane_close(&pane),
-                        None => Ok(()),
-                    }
-                }
-                Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, .. }) => {
+                Event::Key(KeyEvent { code, .. }) => handle_key(&mut model, &screen, code),
+                Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, modifiers, .. }) => {
                     match view.clicks.get(&usize::from(row)) {
-                        Some(click) => handle_click(&mut model, click),
+                        Some(click) => handle_click(&mut model, click, modifiers.contains(KeyModifiers::CONTROL)),
                         None => Ok(()),
                     }
                 }
@@ -200,54 +220,119 @@ fn event_loop(me: &str) -> Result<()> {
     }
 }
 
-/// Moves the selection `step` files down (or up), clamped to the list. Returns whether it moved.
-fn move_selection(model: &mut Model, screen: &Screen, step: isize) -> bool {
-    let files = screen.files();
-    let Some(last) = files.len().checked_sub(1) else { return false };
-    let current = model
-        .selected
-        .as_ref()
-        .and_then(|(root, path)| files.iter().position(|(_, r, c)| *r == root && c.path == *path));
+/// ↑/↓ (`k`/`j`) select rows, →/← (`l`/`h`) expand and collapse pull requests, `o` opens the
+/// selected pull request in the browser, Enter focuses the diff, Esc closes it.
+fn handle_key(model: &mut Model, screen: &Screen, code: KeyCode) -> Result<()> {
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => match move_selection(model, screen, 1) {
+            Some(request) => show_diff(model, &request),
+            None => Ok(()),
+        },
+        KeyCode::Up | KeyCode::Char('k') => match move_selection(model, screen, -1) {
+            Some(request) => show_diff(model, &request),
+            None => Ok(()),
+        },
+        KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(Key::Pr(url)) = &model.selected {
+                expand(model, url.clone());
+            }
+            Ok(())
+        }
+        KeyCode::Left | KeyCode::Char('h') => match model.selected.clone() {
+            Some(Key::Pr(url)) => {
+                model.expanded.remove(&url);
+                Ok(())
+            }
+            Some(Key::PrFile(url, _)) => {
+                model.expanded.remove(&url);
+                model.selected = Some(Key::Pr(url.clone()));
+                show_diff(model, &DiffRequest::Pr { url, path: None })
+            }
+            _ => Ok(()),
+        },
+        KeyCode::Char('o') => match &model.selected {
+            Some(Key::Pr(url) | Key::PrFile(url, _)) => open_url(url),
+            _ => Ok(()),
+        },
+        KeyCode::Enter => match &model.diff_pane {
+            Some(pane) => herdr::pane_focus(pane),
+            None => Ok(()),
+        },
+        KeyCode::Esc => {
+            model.selected = None;
+            match model.diff_pane.take() {
+                Some(pane) => herdr::pane_close(&pane),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Moves the selection `step` rows down (or up), clamped to the list. Returns the newly
+/// selected row's diff, or `None` when the selection did not move.
+fn move_selection(model: &mut Model, screen: &Screen, step: isize) -> Option<DiffRequest> {
+    let rows = screen.rows();
+    let last = rows.len().checked_sub(1)?;
+    let current = model.selected.as_ref().and_then(|key| rows.iter().position(|(_, click)| click.key() == *key));
     let next = match current {
         Some(i) => i.saturating_add_signed(step).min(last),
         None if step > 0 => 0,
         None => last,
     };
     if Some(next) == current {
-        return false;
+        return None;
     }
-    let (_, root, change) = files[next];
-    model.selected = Some((root.clone(), change.path.clone()));
-    true
+    let click = rows[next].1;
+    model.selected = Some(click.key());
+    Some(click.diff_request())
 }
 
-fn handle_click(model: &mut Model, click: &Click) -> Result<()> {
-    match click {
-        Click::Pr { url } => {
-            Command::new("xdg-open")
-                .arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("xdg-open")?;
-        }
-        Click::File { root, change } => {
-            model.selected = Some((root.clone(), change.path.clone()));
-            show_selected_diff(model)?;
-        }
+/// Lists a pull request's files under it, fetching them in the background.
+fn expand(model: &mut Model, url: String) {
+    if !model.expanded.insert(url.clone()) {
+        return;
     }
+    model.pr_files.remove(&url); // refetch: an open PR may have changed
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let files = github::pr_files(&url);
+        let _ = tx.send((url, files));
+    });
+    model.files_jobs.push(rx);
+}
+
+fn open_url(url: &str) -> Result<()> {
+    Command::new("xdg-open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("xdg-open")?;
     Ok(())
 }
 
-/// Shows the selected file's diff without taking focus from the sidebar: points the running
-/// diff viewer at it (it redraws in place), or opens the viewer next to the agent.
-fn show_selected_diff(model: &mut Model) -> Result<()> {
-    let Some((root, path)) = &model.selected else { return Ok(()) };
-    let Some(Ok(status)) = model.statuses.get(root) else { return Ok(()) };
-    let Some(change) = status.changes.iter().find(|c| &c.path == path) else { return Ok(()) };
+/// Clicking selects the row and shows its diff; a pull request row also expands or collapses.
+/// Ctrl+click on a pull request opens it in the browser.
+fn handle_click(model: &mut Model, click: &Click, ctrl: bool) -> Result<()> {
+    if let (Click::Pr { url }, true) = (click, ctrl) {
+        return open_url(url);
+    }
+    if let Click::Pr { url } = click {
+        if !model.expanded.remove(url) {
+            expand(model, url.clone());
+        }
+    }
+    model.selected = Some(click.key());
+    show_diff(model, &click.diff_request())
+}
+
+/// Shows a diff without taking focus from the sidebar: points the running diff viewer at it
+/// (it redraws in place), or opens the viewer next to the agent.
+fn show_diff(model: &mut Model, request: &DiffRequest) -> Result<()> {
     let file = diff::request_file(&model.me);
-    diff::write_request(&file, &DiffRequest::new(root, change))?;
+    diff::write_request(&file, request)?;
     if model.diff_pane.as_deref().is_some_and(herdr::pane_exists) {
         return Ok(());
     }
@@ -334,21 +419,28 @@ fn sample(me: &str, model: &mut Model) -> Result<bool> {
             }
         }
     }
-    for pr in activity.prs {
-        if !prs.iter().any(|r| r.pr == pr) {
+    // PRs named by number belong to the repository of the directory they were used in.
+    let mut mentioned = activity.prs;
+    for (number, dir) in activity.pr_numbers {
+        let Some(root) = repos::repo_root(&dir) else { continue };
+        let slugs = model.remotes.entry(root.clone()).or_insert_with(|| github::remote_slugs(&root));
+        if let Some((owner, repo)) = slugs.first().and_then(|slug| slug.split_once('/')) {
+            mentioned.push(PrRef { owner: owner.into(), repo: repo.into(), number });
+        }
+    }
+    for pr in mentioned {
+        if !prs.iter().any(|r| r.pr.same(&pr)) {
             prs.push(PrRecord { pr, root: None, status: None });
             dirty = true;
         }
     }
-    // A PR belongs to the touched checkout whose remote is its repo; opening it counts as
-    // a change to that checkout.
+    // A PR belongs to the touched checkout whose remote is its repo, and is listed under it.
     for pr in prs.iter_mut().filter(|p| p.root.is_none()) {
         let slug = pr.pr.slug();
-        let owner = records.iter_mut().find(|r| {
+        let owner = records.iter().find(|r| {
             model.remotes.entry(r.root.clone()).or_insert_with(|| github::remote_slugs(&r.root)).contains(&slug)
         });
         if let Some(record) = owner {
-            record.changed = true;
             pr.root = Some(record.root.clone());
             dirty = true;
         }
@@ -489,13 +581,14 @@ fn render(model: &Model, cols: usize) -> Screen {
     if !session.title.is_empty() {
         lines.push(vec![(fit_end(&session.title, cols), Tone::Dim)]);
     }
-    // Changed repos that still exist (`refresh_git` skips deleted ones), then PRs whose
-    // repo has no touched checkout.
+    // Repos the chat changed or has pull requests in (`refresh_git` skips deleted ones), then
+    // PRs whose repo has no touched checkout.
+    let has_prs = |root: &PathBuf| session.repos.prs.iter().any(|p| p.root.as_ref() == Some(root));
     let shown: Vec<&PathBuf> = session
         .repos
         .repos
         .iter()
-        .filter(|r| r.changed && model.statuses.contains_key(&r.root))
+        .filter(|r| (r.changed || has_prs(&r.root)) && model.statuses.contains_key(&r.root))
         .map(|r| &r.root)
         .collect();
     let orphans: Vec<&PrRecord> = session.repos.prs.iter().filter(|p| p.root.is_none()).collect();
@@ -508,8 +601,7 @@ fn render(model: &Model, cols: usize) -> Screen {
         }
         lines.push(repo_header(root, model.statuses.get(root), cols));
         for pr in session.repos.prs.iter().filter(|p| p.root.as_ref() == Some(root)) {
-            clicks.insert(lines.len(), Click::Pr { url: pr.pr.url() });
-            lines.push(pr_line(pr, model.pr_errors.get(&pr.pr.url()), cols));
+            push_pr(&mut lines, &mut clicks, model, pr, cols);
         }
         match model.statuses.get(root) {
             None => {}
@@ -517,14 +609,8 @@ fn render(model: &Model, cols: usize) -> Screen {
             Some(Ok(s)) => {
                 for change in &s.changes {
                     let code = String::from_utf8_lossy(&change.code).into_owned();
-                    let path = fit_start(&change.display(), cols.saturating_sub(4));
                     clicks.insert(lines.len(), Click::File { root: root.clone(), change: change.clone() });
-                    lines.push(vec![
-                        (" ".into(), Tone::Plain),
-                        (code, change_tone(change.code)),
-                        (" ".into(), Tone::Plain),
-                        (path, Tone::Plain),
-                    ]);
+                    lines.push(file_row(" ", (code, change_tone(change.code)), &change.display(), change.stat, cols));
                 }
             }
         }
@@ -534,17 +620,73 @@ fn render(model: &Model, cols: usize) -> Screen {
             lines.push(Vec::new());
         }
         lines.push(vec![(fit_end(&format!("{}/{}", pr.pr.owner, pr.pr.repo), cols), Tone::Repo)]);
-        clicks.insert(lines.len(), Click::Pr { url: pr.pr.url() });
-        lines.push(pr_line(pr, model.pr_errors.get(&pr.pr.url()), cols));
+        push_pr(&mut lines, &mut clicks, model, pr, cols);
     }
     Screen { lines, clicks }
 }
 
-/// ` #121 open ✓`: number (a link to the PR), state, CI rollup (omitted when the PR has no checks).
-fn pr_line(pr: &PrRecord, error: Option<&String>, cols: usize) -> Line {
+/// A pull request row and, when expanded, one row per file it changes.
+fn push_pr(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, model: &Model, pr: &PrRecord, cols: usize) {
+    let url = pr.pr.url();
+    let expanded = model.expanded.contains(&url);
+    clicks.insert(lines.len(), Click::Pr { url: url.clone() });
+    lines.push(pr_line(pr, model.pr_errors.get(&url), expanded, cols));
+    if !expanded {
+        return;
+    }
+    match model.pr_files.get(&url) {
+        None => lines.push(vec![("    …".into(), Tone::Dim)]),
+        Some(Err(e)) => lines.push(vec![(fit_end(&format!("    ! {e}"), cols), Tone::Error)]),
+        Some(Ok(files)) => {
+            for file in files {
+                let tone = match file.code() {
+                    'A' => Tone::Good,
+                    'D' => Tone::Bad,
+                    _ => Tone::Waiting,
+                };
+                clicks.insert(lines.len(), Click::PrFile { url: url.clone(), path: file.path.clone() });
+                let stat = LineStat::Lines { added: file.additions, removed: file.deletions };
+                lines.push(file_row("    ", (file.code().to_string(), tone), &file.path, Some(stat), cols));
+            }
+        }
+    }
+}
+
+/// `<indent><code> <path>        +12 -3`: the path is shortened from the left so the line
+/// counts stay right-aligned in green and red (`bin` for binary files).
+fn file_row(indent: &str, (code, tone): (String, Tone), path: &str, stat: Option<LineStat>, cols: usize) -> Line {
+    let stat: Vec<(String, Tone)> = match stat {
+        Some(LineStat::Lines { added, removed }) => [(added, '+', Tone::Good), (removed, '-', Tone::Bad)]
+            .into_iter()
+            .filter(|(n, ..)| *n > 0)
+            .map(|(n, sign, tone)| (format!("{sign}{n}"), tone))
+            .collect(),
+        Some(LineStat::Binary) => vec![("bin".into(), Tone::Dim)],
+        None => Vec::new(),
+    };
+    let stat_width = stat.iter().map(|(t, _)| t.width() + 1).sum::<usize>(); // each with a leading space
+    let prefix = indent.width() + code.width() + 1;
+    let path = fit_start(path, cols.saturating_sub(prefix + stat_width));
+    let mut line = vec![(indent.to_string(), Tone::Plain), (code, tone), (" ".into(), Tone::Plain)];
+    let gap = cols.saturating_sub(prefix + path.width() + stat_width);
+    line.push((path, Tone::Plain));
+    if !stat.is_empty() {
+        line.push((" ".repeat(gap), Tone::Plain));
+        for (text, tone) in stat {
+            line.push((" ".into(), Tone::Plain));
+            line.push((text, tone));
+        }
+    }
+    line
+}
+
+/// ` ▸ #121 open ✓`: expand marker, number (a link to the PR), state, CI rollup (omitted when
+/// the PR has no checks).
+fn pr_line(pr: &PrRecord, error: Option<&String>, expanded: bool, cols: usize) -> Line {
     let number = format!("#{}", pr.pr.number);
-    let room = cols.saturating_sub(number.width() + 2);
-    let mut line = vec![(" ".into(), Tone::Plain), (hyperlink(&pr.pr.url(), &number), Tone::Link)];
+    let room = cols.saturating_sub(number.width() + 4);
+    let marker = if expanded { " ▾ " } else { " ▸ " };
+    let mut line = vec![(marker.into(), Tone::Dim), (hyperlink(&pr.pr.url(), &number), Tone::Link)];
     match (pr.status, error) {
         (Some(status), _) => {
             let (state, tone) = match status.state {
@@ -687,13 +829,16 @@ fn draw(view: &View, cols: usize) -> Result<()> {
             }
             queue!(out, Print(text), SetAttribute(Attribute::Reset), ResetColor)?;
         }
+        // Rows may carry link escapes: count only the columns they show.
+        let used: usize = line.iter().map(|(text, _)| crate::ansi::width(text)).sum();
         if highlighted {
-            // Highlighted rows are file rows: plain text, so their display width is exact.
-            let used: usize = line.iter().map(|(text, _)| text.width()).sum();
             let pad = " ".repeat(cols.saturating_sub(used));
             queue!(out, SetAttribute(Attribute::Reverse), Print(pad), SetAttribute(Attribute::Reset))?;
+        } else if used < cols {
+            // Not on full rows: after the last column the cursor waits to wrap, and an erase
+            // there wipes that last cell.
+            queue!(out, terminal::Clear(terminal::ClearType::UntilNewLine))?;
         }
-        queue!(out, terminal::Clear(terminal::ClearType::UntilNewLine))?;
     }
     queue!(out, cursor::MoveTo(0, view.lines.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
     out.flush()?;
@@ -730,6 +875,22 @@ mod tests {
     }
 
     #[test]
+    fn file_rows_right_align_line_counts_and_shorten_the_path() {
+        let text = |line: &Line| line.iter().map(|(t, _)| t.as_str()).collect::<String>();
+        let stat = |added, removed| Some(LineStat::Lines { added, removed });
+        let row = file_row(" ", (" M".into(), Tone::Unstaged), "src/a.rs", stat(12, 3), 24);
+        assert_eq!(text(&row), format!("  M src/a.rs{}+12 -3", " ".repeat(6)));
+        assert_eq!(text(&row).width(), 24, "counts end at the right edge");
+        assert!(row.contains(&("+12".into(), Tone::Good)) && row.contains(&("-3".into(), Tone::Bad)));
+        // Long paths give way to the counts; zero counts and missing stats are left out.
+        let row = file_row(" ", ("??".into(), Tone::Untracked), "deep/nested/dir/new_file.rs", stat(40, 0), 24);
+        assert_eq!(text(&row), " ?? …dir/new_file.rs +40");
+        assert_eq!(text(&row).width(), 24);
+        assert_eq!(text(&file_row(" ", ("A ".into(), Tone::Staged), "logo.png", Some(LineStat::Binary), 20)), " A  logo.png     bin");
+        assert_eq!(text(&file_row(" ", (" M".into(), Tone::Unstaged), "x.rs", None, 20)), "  M x.rs");
+    }
+
+    #[test]
     fn change_codes_map_to_git_colors() {
         assert_eq!(change_tone(*b"M "), Tone::Staged);
         assert_eq!(change_tone(*b" M"), Tone::Unstaged);
@@ -741,7 +902,7 @@ mod tests {
     #[test]
     fn rows_clicks_selection_and_scrolling_stay_aligned() {
         let root = PathBuf::from("/r/app");
-        let change = |code: &[u8; 2], path: &str| Change { code: *code, path: path.into(), orig: None };
+        let change = |code: &[u8; 2], path: &str| Change { code: *code, path: path.into(), orig: None, stat: None };
         let pr = PrRef { owner: "o".into(), repo: "app".into(), number: 7 };
         let mut model = Model::default();
         model.statuses.insert(
@@ -778,14 +939,12 @@ mod tests {
         assert_eq!(view.lines.len(), 5);
         assert_eq!(view.clicks.keys().copied().collect::<Vec<_>>(), [3]);
 
-        // Arrows walk the files in order and stop at the ends.
-        let selected = |m: &Model| m.selected.as_ref().map(|(_, p)| p.clone());
+        // Arrows walk all rows in order (the PR too), report the diff to show, and stop at ends.
+        assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::Pr { url: pr.url(), path: None }));
+        assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::local(&root, &change(b" M", "a.rs"))));
         move_selection(&mut model, &screen, 1);
-        assert_eq!(selected(&model).as_deref(), Some("a.rs"));
-        move_selection(&mut model, &screen, 1);
-        move_selection(&mut model, &screen, 1);
-        assert_eq!(selected(&model).as_deref(), Some("b.rs"));
-        assert!(!move_selection(&mut model, &screen, 1), "already on the last file");
+        assert_eq!(model.selected, Some(Key::File(root.clone(), "b.rs".into())));
+        assert_eq!(move_selection(&mut model, &screen, 1), None, "already on the last row");
 
         // Selecting the last file scrolls it into view; clicks and highlight follow the scroll.
         let view = window(&screen, 40, 5, &mut scroll, screen.row_of(model.selected.as_ref()));
@@ -793,7 +952,19 @@ mod tests {
         assert_eq!(view.highlight, Some(3));
         assert_eq!(view.clicks.get(&3), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
         assert_eq!(view.clicks.get(&1), Some(&Click::Pr { url: pr.url() }));
-        move_selection(&mut model, &screen, -1);
-        assert_eq!(selected(&model).as_deref(), Some("a.rs"));
+
+        // Expanding the PR lists its files right under it; they are selectable and map to the
+        // PR's per-file diff, and the local files move down.
+        model.expanded.insert(pr.url());
+        let file = PrFile { path: "x.rs".into(), change_type: "ADDED".into(), additions: 5, deletions: 0 };
+        model.pr_files.insert(pr.url(), Ok(vec![file]));
+        let screen = render(&model, 40);
+        assert_eq!(screen.clicks.get(&4), Some(&Click::PrFile { url: pr.url(), path: "x.rs".into() }));
+        assert_eq!(screen.clicks.get(&5), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
+        model.selected = Some(Key::Pr(pr.url()));
+        assert_eq!(
+            move_selection(&mut model, &screen, 1),
+            Some(DiffRequest::Pr { url: pr.url(), path: Some("x.rs".into()) })
+        );
     }
 }

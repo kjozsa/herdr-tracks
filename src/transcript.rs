@@ -47,7 +47,12 @@ pub struct Transcript {
 #[derive(Debug, Default)]
 pub struct Activity {
     pub touches: Vec<Touch>,
+    /// Pull requests the chat opened or referred to: URLs in user messages and tool calls,
+    /// omp `pr://owner/repo/N` paths, `gh pr <verb> N -R owner/repo`.
     pub prs: Vec<PrRef>,
+    /// Pull requests referred to by number only (`pr://N`, `gh pr checkout N`), with the
+    /// directory whose repository they belong to.
+    pub pr_numbers: Vec<(u32, PathBuf)>,
 }
 
 impl Transcript {
@@ -89,7 +94,9 @@ impl Transcript {
 
     fn scan_omp(&mut self, line: &[u8], found: &mut Activity) {
         let is_session = contains(line, b"\"type\":\"session\"");
-        if !is_session && !self.may_hold_pr_result(line, b"\"toolResult\"") && !contains(line, b"\"toolCall\"") {
+        let is_user_link = contains(line, b"\"role\":\"user\"") && contains(line, b"github.com/");
+        if !is_session && !is_user_link && !self.may_hold_pr_result(line, b"\"toolResult\"") && !contains(line, b"\"toolCall\"")
+        {
             return;
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
@@ -100,27 +107,41 @@ impl Transcript {
             return;
         }
         let message = &entry["message"];
-        if message["role"] == "toolResult" {
-            let text: String = message["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect();
-            self.record_result(message["toolCallId"].as_str().unwrap_or_default(), &text, found);
-            return;
-        }
-        for block in message["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "toolCall") {
-            self.record_call(block["id"].as_str(), &omp_call(&block["name"], &block["arguments"]), found);
+        match message["role"].as_str() {
+            Some("toolResult") => {
+                let text: String = message["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect();
+                self.record_result(message["toolCallId"].as_str().unwrap_or_default(), &text, found);
+            }
+            Some("user") => found.prs.extend(github::pr_urls(&message_text(&message["content"]))),
+            _ => {
+                for block in message["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "toolCall") {
+                    let args = &block["arguments"];
+                    self.record_call(block["id"].as_str(), &omp_call(&block["name"], args), args, found);
+                }
+            }
         }
     }
 
     fn scan_claude(&mut self, line: &[u8], found: &mut Activity) {
-        if !contains(line, b"\"tool_use\"") && !self.may_hold_pr_result(line, b"\"tool_result\"") {
+        let is_user_link = contains(line, b"\"type\":\"user\"") && contains(line, b"github.com/");
+        if !is_user_link && !contains(line, b"\"tool_use\"") && !self.may_hold_pr_result(line, b"\"tool_result\"") {
             return;
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
         if let Some(cwd) = entry["cwd"].as_str() {
             self.cwd = PathBuf::from(cwd);
         }
-        for block in entry["message"]["content"].as_array().into_iter().flatten() {
+        let content = &entry["message"]["content"];
+        if entry["type"] == "user" {
+            // The user's own words: a plain string or text blocks (not tool results).
+            found.prs.extend(github::pr_urls(&message_text(content)));
+        }
+        for block in content.as_array().into_iter().flatten() {
             match block["type"].as_str() {
-                Some("tool_use") => self.record_call(block["id"].as_str(), &claude_call(&block["name"], &block["input"]), found),
+                Some("tool_use") => {
+                    let input = &block["input"];
+                    self.record_call(block["id"].as_str(), &claude_call(&block["name"], input), input, found);
+                }
                 Some("tool_result") => {
                     let content = &block["content"];
                     let text: String = match content.as_str() {
@@ -134,10 +155,36 @@ impl Transcript {
         }
     }
 
-    fn record_call(&mut self, id: Option<&str>, call: &Call, found: &mut Activity) {
-        if let (Call::Shell { command, .. }, Some(id)) = (call, id) {
-            if creates_pr(&shell_tokens(command)) {
+    fn record_call(&mut self, id: Option<&str>, call: &Call, args: &Value, found: &mut Activity) {
+        // Only arguments that name things (paths, commands, URLs): file contents being written
+        // may well link pull requests the chat has nothing to do with.
+        const CONTENT: &[&str] = &["content", "input", "new_string", "old_string", "code", "edits"];
+        let raw = args
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| !CONTENT.contains(&key.as_str()))
+            .filter_map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        found.prs.extend(github::pr_urls(&raw));
+        for mention in pr_scheme_refs(&raw) {
+            match mention {
+                PrMention::Full(pr) => found.prs.push(pr),
+                PrMention::Number(n) => found.pr_numbers.push((n, self.cwd.clone())),
+            }
+        }
+        if let Call::Shell { command, cwd } = call {
+            let tokens = shell_tokens(command);
+            if let (true, Some(id)) = (creates_pr(&tokens), id) {
                 self.pr_calls.insert(id.to_string());
+            }
+            let dir = cwd.and_then(|c| resolve(c, &self.cwd)).unwrap_or_else(|| self.cwd.clone());
+            for mention in gh_pr_refs(command) {
+                match mention {
+                    PrMention::Full(pr) => found.prs.push(pr),
+                    PrMention::Number(n) => found.pr_numbers.push((n, dir.clone())),
+                }
             }
         }
         found.touches.extend(call_touches(call, &self.cwd));
@@ -148,6 +195,83 @@ impl Transcript {
             found.prs.extend(github::pr_urls(text));
         }
     }
+}
+
+/// Text of a message's content: a plain string or the `text` of its blocks.
+fn message_text(content: &Value) -> String {
+    match content.as_str() {
+        Some(text) => text.to_string(),
+        None => content.as_array().into_iter().flatten().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+    }
+}
+
+/// A pull request named in full, or by number within some repository.
+#[derive(Debug, PartialEq)]
+enum PrMention {
+    Full(PrRef),
+    Number(u32),
+}
+
+/// omp's pull-request URIs: `pr://owner/repo/N[/…]` and `pr://N[/…]` (the current repo).
+fn pr_scheme_refs(text: &str) -> Vec<PrMention> {
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices("pr://") {
+        let rest = &text[at + "pr://".len()..];
+        let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | ':' | '?' | '#')).unwrap_or(rest.len());
+        let parts: Vec<&str> = rest[..end].split('/').collect();
+        let number = |s: &str| s.parse::<u32>().ok();
+        match parts.as_slice() {
+            [owner, repo, n, ..] if number(n).is_some() && !owner.is_empty() && !repo.is_empty() => {
+                found.push(PrMention::Full(PrRef { owner: owner.to_string(), repo: repo.to_string(), number: number(n).unwrap_or(0) }))
+            }
+            [n, ..] if number(n).is_some() => found.push(PrMention::Number(number(n).unwrap_or(0))),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// `gh pr <verb> N` for verbs that act on an existing PR, with `-R/--repo owner/repo` if given.
+/// Each `;`/`|`/`&&` segment is its own command, and the PR is the verb's first positional
+/// argument: `gh pr diff 5 | head -n 20` names #5, never #20.
+fn gh_pr_refs(command: &str) -> Vec<PrMention> {
+    const VERBS: &[&str] =
+        &["view", "diff", "checkout", "review", "comment", "merge", "edit", "ready", "close", "reopen", "checks"];
+    /// Flags whose next token is their value, not a positional argument.
+    const VALUED: &[&str] =
+        &["-R", "--repo", "--json", "--jq", "-q", "-t", "--template", "-b", "--body", "-F", "--body-file"];
+    let mut found = Vec::new();
+    for segment in command.split(|c| matches!(c, ';' | '|' | '&' | '\n' | '(' | ')')) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let Some(at) = tokens.windows(3).position(|w| w[0] == "gh" && w[1] == "pr" && VERBS.contains(&w[2])) else {
+            continue;
+        };
+        let args = &tokens[at + 3..];
+        let mut repo = None;
+        let mut positional = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i] {
+                "-R" | "--repo" => repo = args.get(i + 1).copied(),
+                flag if flag.starts_with("--repo=") => repo = flag.strip_prefix("--repo="),
+                _ => {}
+            }
+            if VALUED.contains(&args[i]) {
+                i += 2;
+                continue;
+            }
+            if !args[i].starts_with('-') && positional.is_none() {
+                positional = Some(args[i]);
+            }
+            i += 1;
+        }
+        let Some(number) = positional.and_then(|p| p.trim_start_matches('#').parse::<u32>().ok()) else { continue };
+        found.push(match repo.and_then(|r| r.split_once('/')) {
+            Some((owner, repo)) => PrMention::Full(PrRef { owner: owner.into(), repo: repo.into(), number }),
+            None => PrMention::Number(number),
+        });
+    }
+    found
 }
 
 /// The transcript file for a herdr session reference: the reference itself when it is a file,
@@ -460,6 +584,53 @@ mod tests {
             "relative paths resolve against each entry's cwd"
         );
         assert_eq!(activity.prs, [PrRef { owner: "o".into(), repo: "r".into(), number: 19 }], "u9 was no gh pr create");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn gh_pr_verbs_and_pr_uris_name_pull_requests() {
+        let pr = |owner: &str, repo: &str, number| PrMention::Full(PrRef { owner: owner.into(), repo: repo.into(), number });
+        let gh = gh_pr_refs;
+        assert!(gh("gh pr diff https://github.com/o/r/pull/3 | grep -n '^diff' | head -n 5").is_empty(), "URLs are found elsewhere");
+        assert!(gh("gh pr view --help | head -n 6").is_empty());
+        assert_eq!(gh("gh pr diff 5 --color=never | head -n 20"), [PrMention::Number(5)]);
+        assert_eq!(gh("gh pr checkout 36 && git log"), [PrMention::Number(36)]);
+        assert_eq!(gh("gh pr view --json title 12 -R Kamuno-CH/e2e_testing"), [pr("Kamuno-CH", "e2e_testing", 12)]);
+        assert_eq!(gh("gh pr review #7 --approve --repo=o/r"), [pr("o", "r", 7)]);
+        assert!(gh("gh pr list --limit 5; gh pr create --fill; gh pr view --web").is_empty());
+        assert_eq!(
+            pr_scheme_refs("pr://kamuno-ch/e2e_testing/36/diff/all and \"pr://41\""),
+            [pr("kamuno-ch", "e2e_testing", 36), PrMention::Number(41)]
+        );
+        assert!(pr_scheme_refs("pr://kamuno-ch/e2e_testing").is_empty());
+    }
+
+    #[test]
+    fn referenced_prs_come_from_user_words_and_call_targets_not_contents() {
+        let line = |role: &str, content: &str| format!(r#"{{"type":"message","message":{{"role":"{role}","content":{content}}}}}"#);
+        let call = |name: &str, args: &str| {
+            line("assistant", &format!(r#"[{{"type":"toolCall","id":"x","name":"{name}","arguments":{args}}}]"#))
+        };
+        let (mut t, file) = transcript(
+            "refs",
+            Format::Omp,
+            &format!(
+                "{}\n",
+                [
+                    r#"{"type":"session","cwd":"/work/app"}"#.to_string(),
+                    line("user", r#"[{"type":"text","text":"review https://github.com/o/r/pull/36/changes"}]"#),
+                    call("read", r#"{"path":"pr://o/other/5/diff/all"}"#),
+                    call("bash", r#"{"command":"gh pr checkout 9","cwd":"../lib"}"#),
+                    call("write", r#"{"path":"CHANGELOG.md","content":"fixed in https://github.com/o/r/pull/99"}"#),
+                    line("toolResult", r#"[{"type":"text","text":"see https://github.com/o/r/pull/98"}]"#),
+                ]
+                .join("\n")
+            ),
+        );
+        let activity = t.poll().unwrap();
+        let numbers: Vec<_> = activity.prs.iter().map(|p| (p.repo.as_str(), p.number)).collect();
+        assert_eq!(numbers, [("r", 36), ("other", 5)], "file contents and tool output do not count");
+        assert_eq!(activity.pr_numbers, [(9, PathBuf::from("/work/lib"))], "numbers carry the command's directory");
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }

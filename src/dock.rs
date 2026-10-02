@@ -47,6 +47,13 @@ fn place(without_agent: bool) -> Result<()> {
         None => context_tab()?,
     };
     let panes = herdr::pane_list()?;
+    // Forget sidebars of tabs that have since been closed.
+    let live_tabs: HashSet<&str> = panes.iter().map(|p| p.tab_id.as_str()).collect();
+    let known = guard.state.tabs.len();
+    guard.state.tabs.retain(|tab, _| live_tabs.contains(tab.as_str()));
+    if guard.state.tabs.len() != known {
+        guard.save()?;
+    }
     let tab_panes: Vec<&PaneInfo> = panes.iter().filter(|p| p.tab_id == tab).collect();
     if guard.state.tabs.get(&tab).is_some_and(|id| tab_panes.iter().any(|p| &p.pane_id == id)) {
         return Ok(());

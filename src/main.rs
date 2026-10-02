@@ -1,3 +1,4 @@
+mod ansi;
 mod diff;
 mod dock;
 mod git;
