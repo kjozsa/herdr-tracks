@@ -151,6 +151,12 @@ fn split_widths(pane: &str) -> Result<(u32, u32, f64)> {
     Ok((split.rect.width, me.rect.width, split.ratio))
 }
 
+/// Re-snaps a docked sidebar to the configured width, e.g. after a neighbouring pane closed
+/// and herdr handed it that pane's columns.
+pub fn hold_width(pane: &str) -> Result<()> {
+    snap_width(pane, sidebar_width())
+}
+
 /// Resizes the right-hand `pane` to `width` columns. herdr gives the left side
 /// round(total * ratio) columns and clamps ratios to 0.1..=0.9, so on wide splits the pane
 /// cannot get narrower than ~10% of the split; resizing the right pane "right" grows the ratio.

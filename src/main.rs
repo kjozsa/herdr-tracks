@@ -7,6 +7,7 @@ mod repos;
 mod sidebar;
 mod state;
 mod transcript;
+mod term;
 
 pub const PLUGIN_ID: &str = "kjozsa.git-sidebar";
 /// Manifest `[[panes]]` ids.

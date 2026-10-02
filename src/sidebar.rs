@@ -2,7 +2,7 @@
 //! session changed (edit/write/commit tool calls in its omp or Claude Code transcript, or a
 //! repo's git state moving after the session first touched it), with branch + changed files.
 
-use crate::diff::DiffRequest;
+use crate::diff::{self, DiffRequest};
 use crate::git::{self, Change, RepoStatus};
 use crate::github::{self, Checks, PrRef, PrState, PrStatus};
 use crate::herdr::{self, PaneInfo};
@@ -10,10 +10,7 @@ use crate::repos;
 use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
 use crate::transcript::{Format, Touch, Transcript};
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton, MouseEvent,
-    MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 use std::collections::HashMap;
@@ -27,8 +24,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const GIT_EVERY: Duration = Duration::from_secs(5);
 const PR_EVERY: Duration = Duration::from_secs(30);
-/// Delay before the selected file's diff opens, so holding an arrow key skips through.
-const DIFF_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Which chat session the sidebar follows, and whether its repo set is persisted.
 struct Session {
@@ -55,8 +50,8 @@ struct Model {
     diff_pane: Option<String>,
     /// File chosen with the arrow keys or a click, as (checkout root, path); its diff is shown.
     selected: Option<(PathBuf, String)>,
-    /// When the selected file's diff should open; holding an arrow key opens only the last one.
-    diff_due: Option<Instant>,
+    /// This sidebar's own pane id; names the request file its diff viewer follows.
+    me: String,
     /// First rendered row on screen when the list is taller than the pane.
     scroll: usize,
 }
@@ -111,13 +106,13 @@ struct PrBatch {
 
 pub fn run() -> Result<()> {
     let me = std::env::var("HERDR_PANE_ID").map_err(|_| anyhow!("HERDR_PANE_ID not set"))?;
-    let _term = Term::enter()?;
+    let _term = crate::term::Term::enter()?;
     event_loop(&me)
 }
 
 /// Runs for the pane's lifetime. There is no quit key: the sidebar is mandatory.
 fn event_loop(me: &str) -> Result<()> {
-    let mut model = Model::default();
+    let mut model = Model { me: me.to_string(), ..Model::default() };
     let mut shown: (Vec<Line>, Option<usize>) = (Vec::new(), None);
     let mut next_sample = Instant::now();
     let mut next_git = Instant::now();
@@ -159,12 +154,6 @@ fn event_loop(me: &str) -> Result<()> {
             next_pr = now + PR_EVERY;
             model.pr_job = start_pr_refresh(&model);
         }
-        if model.diff_due.is_some_and(|due| now >= due) {
-            model.diff_due = None;
-            if let Err(e) = show_selected_diff(&mut model) {
-                model.error = Some(format!("{e:#}"));
-            }
-        }
         let (cols, rows) = terminal::size()?;
         let screen = render(&model, usize::from(cols));
         let selected_row = screen.row_of(model.selected.as_ref());
@@ -173,19 +162,13 @@ fn event_loop(me: &str) -> Result<()> {
             draw(&view, usize::from(cols))?;
             shown = (view.lines.clone(), view.highlight);
         }
-        let mut deadline = next_sample.min(next_git);
-        if let Some(due) = model.diff_due {
-            deadline = deadline.min(due);
-        }
-        if event::poll(deadline.saturating_duration_since(Instant::now()))? {
+        if event::poll(next_sample.min(next_git).saturating_duration_since(Instant::now()))? {
             let result = match event::read()? {
                 Event::Key(KeyEvent { code: KeyCode::Down | KeyCode::Char('j'), .. }) => {
-                    move_selection(&mut model, &screen, 1);
-                    Ok(())
+                    if move_selection(&mut model, &screen, 1) { show_selected_diff(&mut model) } else { Ok(()) }
                 }
                 Event::Key(KeyEvent { code: KeyCode::Up | KeyCode::Char('k'), .. }) => {
-                    move_selection(&mut model, &screen, -1);
-                    Ok(())
+                    if move_selection(&mut model, &screen, -1) { show_selected_diff(&mut model) } else { Ok(()) }
                 }
                 Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => match &model.diff_pane {
                     Some(pane) => herdr::pane_focus(pane),
@@ -193,7 +176,6 @@ fn event_loop(me: &str) -> Result<()> {
                 },
                 Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
                     model.selected = None;
-                    model.diff_due = None;
                     match model.diff_pane.take() {
                         Some(pane) => herdr::pane_close(&pane),
                         None => Ok(()),
@@ -207,7 +189,7 @@ fn event_loop(me: &str) -> Result<()> {
                 }
                 Event::Resize(..) => {
                     shown = (Vec::new(), None);
-                    Ok(())
+                    crate::dock::hold_width(&model.me)
                 }
                 _ => Ok(()),
             };
@@ -218,11 +200,10 @@ fn event_loop(me: &str) -> Result<()> {
     }
 }
 
-/// Moves the selection `step` files down (or up), clamped to the list; the diff follows
-/// once the keys settle.
-fn move_selection(model: &mut Model, screen: &Screen, step: isize) {
+/// Moves the selection `step` files down (or up), clamped to the list. Returns whether it moved.
+fn move_selection(model: &mut Model, screen: &Screen, step: isize) -> bool {
     let files = screen.files();
-    let Some(last) = files.len().checked_sub(1) else { return };
+    let Some(last) = files.len().checked_sub(1) else { return false };
     let current = model
         .selected
         .as_ref()
@@ -233,11 +214,11 @@ fn move_selection(model: &mut Model, screen: &Screen, step: isize) {
         None => last,
     };
     if Some(next) == current {
-        return;
+        return false;
     }
     let (_, root, change) = files[next];
     model.selected = Some((root.clone(), change.path.clone()));
-    model.diff_due = Some(Instant::now() + DIFF_DEBOUNCE);
+    true
 }
 
 fn handle_click(model: &mut Model, click: &Click) -> Result<()> {
@@ -253,30 +234,27 @@ fn handle_click(model: &mut Model, click: &Click) -> Result<()> {
         }
         Click::File { root, change } => {
             model.selected = Some((root.clone(), change.path.clone()));
-            model.diff_due = None;
             show_selected_diff(model)?;
         }
     }
     Ok(())
 }
 
-/// Shows the selected file's diff without taking focus from the sidebar. The new pane is split
-/// off the previous diff pane, which then closes, so the layout holds still while browsing.
+/// Shows the selected file's diff without taking focus from the sidebar: points the running
+/// diff viewer at it (it redraws in place), or opens the viewer next to the agent.
 fn show_selected_diff(model: &mut Model) -> Result<()> {
     let Some((root, path)) = &model.selected else { return Ok(()) };
     let Some(Ok(status)) = model.statuses.get(root) else { return Ok(()) };
     let Some(change) = status.changes.iter().find(|c| &c.path == path) else { return Ok(()) };
-    let agent = model.session.as_ref().map(|s| s.pane_id.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
-    let env = [(crate::diff::ENV, serde_json::to_string(&DiffRequest::new(root, change))?)];
-    let open = |target: &str| herdr::open_plugin_pane(&crate::dock::plugin_id(), crate::DIFF_ENTRYPOINT, target, false, &env);
-    let pane = match model.diff_pane.as_deref() {
-        // The previous diff pane may already be gone (the user quit it): fall back to the agent.
-        Some(previous) => open(previous).or_else(|_| open(&agent))?,
-        None => open(&agent)?,
-    };
-    if let Some(previous) = model.diff_pane.replace(pane) {
-        let _ = herdr::pane_close(&previous);
+    let file = diff::request_file(&model.me);
+    diff::write_request(&file, &DiffRequest::new(root, change))?;
+    if model.diff_pane.as_deref().is_some_and(herdr::pane_exists) {
+        return Ok(());
     }
+    let agent = model.session.as_ref().map(|s| s.pane_id.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
+    let env = [(diff::ENV, file.display().to_string()), (diff::OWNER_ENV, model.me.clone())];
+    model.diff_pane =
+        Some(herdr::open_plugin_pane(&crate::dock::plugin_id(), crate::DIFF_ENTRYPOINT, &agent, false, &env)?);
     Ok(())
 }
 
@@ -739,24 +717,6 @@ fn style(out: &mut impl Write, tone: Tone) -> Result<()> {
     Ok(())
 }
 
-/// Raw mode + alternate screen for the pane's lifetime.
-struct Term;
-
-impl Term {
-    fn enter() -> Result<Self> {
-        terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
-        Ok(Term)
-    }
-}
-
-impl Drop for Term {
-    fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,7 +785,7 @@ mod tests {
         move_selection(&mut model, &screen, 1);
         move_selection(&mut model, &screen, 1);
         assert_eq!(selected(&model).as_deref(), Some("b.rs"));
-        assert!(model.diff_due.is_some(), "moving schedules the diff");
+        assert!(!move_selection(&mut model, &screen, 1), "already on the last file");
 
         // Selecting the last file scrolls it into view; clicks and highlight follow the scroll.
         let view = window(&screen, 40, 5, &mut scroll, screen.row_of(model.selected.as_ref()));

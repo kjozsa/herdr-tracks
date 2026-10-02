@@ -15,7 +15,7 @@ title = "git"
 placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" pane"]
 
-# Opened by clicking a changed file in the sidebar; closes itself when the pager quits.
+# Diff viewer opened from the sidebar; follows the sidebar's selection in place. `q` closes it.
 [[panes]]
 id = "diff"
 title = "diff"

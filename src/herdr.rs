@@ -139,6 +139,11 @@ pub fn pane_focus(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether the pane is still open.
+pub fn pane_exists(pane_id: &str) -> bool {
+    call("pane.get", json!({"pane_id": pane_id})).is_ok()
+}
+
 /// Opens a plugin pane entrypoint as a right split of `target_pane_id` and returns its id.
 /// `env` is added to the pane process's environment.
 pub fn open_plugin_pane(
