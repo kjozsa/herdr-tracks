@@ -20,7 +20,7 @@ pub fn call(method: &str, params: Value) -> Result<Value> {
     let path = socket_path()?;
     let mut stream =
         UnixStream::connect(&path).with_context(|| format!("connecting {}", path.display()))?;
-    let mut line = serde_json::to_vec(&json!({"id": "git-sidebar", "method": method, "params": params}))?;
+    let mut line = serde_json::to_vec(&json!({"id": "tracks", "method": method, "params": params}))?;
     line.push(b'\n');
     stream.write_all(&line)?;
     let mut reply = String::new();

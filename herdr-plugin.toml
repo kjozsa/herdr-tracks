@@ -1,8 +1,8 @@
-id = "kjozsa.git-sidebar"
-name = "Git Sidebar"
+id = "kjozsa.tracks"
+name = "Tracks"
 version = "0.1.0"
 min_herdr_version = "0.9.3"
-description = "Right-docked pane listing branch and changed files of every git repo the tab's agent session works in."
+description = "The tracks an agent chat leaves: branch, changed files, diffs and PRs of every git repo it changed, docked on the right."
 platforms = ["linux"]
 
 [[build]]
@@ -11,41 +11,41 @@ command = ["cargo", "build", "--release"]
 # Pane commands start in the pane's cwd, so the binary is addressed via the plugin root.
 [[panes]]
 id = "sidebar"
-title = "git"
+title = "tracks"
 placement = "split"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" pane"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-tracks\" pane"]
 
 # Diff viewer opened from the sidebar; follows the sidebar's selection in place. `q` closes it.
 [[panes]]
 id = "diff"
 title = "diff"
 placement = "split"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-git-sidebar\" diff"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-tracks\" diff"]
 
 [[actions]]
 id = "show"
-title = "Git Sidebar: show"
+title = "Tracks: show"
 description = "Dock the sidebar in this tab, even without an agent."
 contexts = ["workspace", "pane"]
-command = ["target/release/herdr-git-sidebar", "show"]
+command = ["target/release/herdr-tracks", "show"]
 
 # The sidebar is mandatory in tabs that host an agent: these idempotent hooks dock it, and
 # `pane.closed` brings it straight back when it is closed.
 [[events]]
 on = "pane.agent_detected"
-command = ["target/release/herdr-git-sidebar", "ensure"]
+command = ["target/release/herdr-tracks", "ensure"]
 
 [[events]]
 on = "pane.closed"
-command = ["target/release/herdr-git-sidebar", "ensure"]
+command = ["target/release/herdr-tracks", "ensure"]
 
 [[events]]
 on = "tab.focused"
-command = ["target/release/herdr-git-sidebar", "ensure"]
+command = ["target/release/herdr-tracks", "ensure"]
 
 [[events]]
 on = "pane.focused"
-command = ["target/release/herdr-git-sidebar", "ensure"]
+command = ["target/release/herdr-tracks", "ensure"]
 
 [[startup]]
-command = ["target/release/herdr-git-sidebar", "startup"]
+command = ["target/release/herdr-tracks", "startup"]

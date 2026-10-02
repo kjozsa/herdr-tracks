@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 /// Environment variable naming the request file the viewer follows.
-pub const ENV: &str = "GIT_SIDEBAR_DIFF_FILE";
+pub const ENV: &str = "TRACKS_DIFF_FILE";
 /// Environment variable naming the sidebar pane that opened the viewer.
-pub const OWNER_ENV: &str = "GIT_SIDEBAR_DIFF_OWNER";
+pub const OWNER_ENV: &str = "TRACKS_DIFF_OWNER";
 /// How often the viewer checks the request file.
 const POLL: Duration = Duration::from_millis(50);
 /// How often the viewer checks that its sidebar still exists.

@@ -9,11 +9,11 @@ mod state;
 mod transcript;
 mod term;
 
-pub const PLUGIN_ID: &str = "kjozsa.git-sidebar";
+pub const PLUGIN_ID: &str = "kjozsa.tracks";
 /// Manifest `[[panes]]` ids.
 pub const SIDEBAR_ENTRYPOINT: &str = "sidebar";
 pub const DIFF_ENTRYPOINT: &str = "diff";
-pub const BIN_NAME: &str = "herdr-git-sidebar";
+pub const BIN_NAME: &str = "herdr-tracks";
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();

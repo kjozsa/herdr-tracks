@@ -382,7 +382,7 @@ mod tests {
 
     /// Writes `content` to a fresh transcript file and returns a reader positioned at its start.
     fn transcript(name: &str, format: Format, content: &str) -> (Transcript, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("git-sidebar-test-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tracks-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("t.jsonl");
         std::fs::write(&file, content).unwrap();
