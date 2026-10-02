@@ -6,7 +6,10 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// herdr's defaults for `[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`.
 const DEFAULT_WIDTH: u32 = 26;
+const DEFAULT_MIN_WIDTH: u32 = 18;
+const DEFAULT_MAX_WIDTH: u32 = 36;
 /// Columns left for the rest of the tab; narrower tabs are not auto-docked.
 const MIN_MAIN_WIDTH: u32 = 40;
 /// herdr clamps split ratios to 0.1..=0.9.
@@ -203,24 +206,31 @@ fn snap_width(pane: &str, width: u32) -> Result<()> {
     Ok(())
 }
 
-/// herdr's left sidebar width: live value from `session.json`, else `[ui] sidebar_width`
-/// from config, else herdr's default.
+/// herdr's left sidebar width: the live value from `session.json` (a dragged width), else
+/// `[ui] sidebar_width`, clamped to `[ui] sidebar_min_width..=sidebar_max_width` as herdr does.
 pub fn sidebar_width() -> u32 {
-    let live = herdr_runtime_dir().join("session.json");
-    let from_session = std::fs::read(live)
+    let live = std::fs::read(herdr_runtime_dir().join("session.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v["sidebar_width"].as_u64());
-    let from_config = || {
-        let text = std::fs::read_to_string(config_path()).ok()?;
-        let cfg: toml::Table = text.parse().ok()?;
-        cfg.get("ui")?.get("sidebar_width")?.as_integer().and_then(|w| u64::try_from(w).ok())
+        .and_then(|v| v["sidebar_width"].as_u64())
+        .and_then(|w| u32::try_from(w).ok());
+    let ui = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|cfg| cfg.get("ui")?.as_table().cloned());
+    resolve_width(live, ui.as_ref())
+}
+
+fn resolve_width(live: Option<u32>, ui: Option<&toml::Table>) -> u32 {
+    let setting = |key: &str, default: u32| {
+        ui.and_then(|t| t.get(key)?.as_integer())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
     };
-    from_session
-        .or_else(from_config)
-        .and_then(|w| u32::try_from(w).ok())
-        .filter(|w| *w > 0)
-        .unwrap_or(DEFAULT_WIDTH)
+    let min = setting("sidebar_min_width", DEFAULT_MIN_WIDTH);
+    let max = setting("sidebar_max_width", DEFAULT_MAX_WIDTH).max(min);
+    live.filter(|w| *w > 0).unwrap_or_else(|| setting("sidebar_width", DEFAULT_WIDTH)).clamp(min, max)
 }
 
 /// Directory holding the session's socket and `session.json` (named sessions have their own).
@@ -239,4 +249,21 @@ fn config_dir() -> PathBuf {
 
 fn config_path() -> PathBuf {
     std::env::var_os("HERDR_CONFIG_PATH").map(PathBuf::from).unwrap_or_else(|| config_dir().join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_follows_herdr_clamping() {
+        let ui = |text: &str| text.parse::<toml::Table>().unwrap();
+        assert_eq!(resolve_width(None, None), DEFAULT_WIDTH);
+        let forced = ui("sidebar_width = 50\nsidebar_min_width = 50\nsidebar_max_width = 100");
+        assert_eq!(resolve_width(None, Some(&forced)), 50);
+        assert_eq!(resolve_width(Some(80), Some(&forced)), 80, "a dragged width wins within bounds");
+        assert_eq!(resolve_width(None, Some(&ui("sidebar_min_width = 50"))), 50, "minimum lifts the default width");
+        assert_eq!(resolve_width(None, Some(&ui("sidebar_width = 60"))), DEFAULT_MAX_WIDTH, "default maximum caps it");
+        assert_eq!(resolve_width(Some(10), None), DEFAULT_MIN_WIDTH);
+    }
 }
