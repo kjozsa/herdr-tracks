@@ -139,6 +139,12 @@ pub fn pane_focus(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Lets the pane's application receive right-clicks instead of herdr's pane menu.
+pub fn forward_right_click(pane_id: &str) -> Result<()> {
+    call("pane.input.set", json!({"pane_id": pane_id, "right_click": "pane"}))?;
+    Ok(())
+}
+
 /// Whether the pane is still open.
 pub fn pane_exists(pane_id: &str) -> bool {
     call("pane.get", json!({"pane_id": pane_id})).is_ok()

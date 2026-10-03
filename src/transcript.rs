@@ -37,6 +37,8 @@ pub struct Transcript {
     path: Option<PathBuf>,
     offset: u64,
     pending: Vec<u8>,
+    /// End of the transcript line being scanned: where its touches happened.
+    line_end: u64,
     /// The agent's working directory as of the last line read; base for relative tool paths.
     cwd: PathBuf,
     /// Ids of `gh pr create` calls whose result has not been read yet.
@@ -57,7 +59,21 @@ pub struct Activity {
 
 impl Transcript {
     pub fn new(format: Format, session_ref: String, fallback_cwd: PathBuf) -> Self {
-        Self { format, session_ref, path: None, offset: 0, pending: Vec::new(), cwd: fallback_cwd, pr_calls: HashSet::new() }
+        Self {
+            format,
+            session_ref,
+            path: None,
+            offset: 0,
+            pending: Vec::new(),
+            line_end: 0,
+            cwd: fallback_cwd,
+            pr_calls: HashSet::new(),
+        }
+    }
+
+    /// How far the transcript has been read: positions of later touches are greater.
+    pub fn position(&self) -> u64 {
+        self.offset - self.pending.len() as u64
     }
 
     pub fn poll(&mut self) -> std::io::Result<Activity> {
@@ -72,12 +88,16 @@ impl Transcript {
             self.pending.clear();
         }
         file.seek(SeekFrom::Start(self.offset))?;
+        let base = self.position();
         let read = file.read_to_end(&mut self.pending)?;
         self.offset += read as u64;
         let complete = self.pending.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
         let mut found = Activity::default();
         let lines = std::mem::take(&mut self.pending);
+        let mut start = 0;
         for line in lines[..complete].split(|b| *b == b'\n') {
+            start += line.len() + 1;
+            self.line_end = base + start as u64;
             match self.format {
                 Format::Omp => self.scan_omp(line, &mut found),
                 Format::Claude => self.scan_claude(line, &mut found),
@@ -187,7 +207,8 @@ impl Transcript {
                 }
             }
         }
-        found.touches.extend(call_touches(call, &self.cwd));
+        let at = Some(self.line_end);
+        found.touches.extend(call_touches(call, &self.cwd).into_iter().map(|t| Touch { at, ..t }));
     }
 
     fn record_result(&mut self, id: &str, text: &str, found: &mut Activity) {
@@ -305,6 +326,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 pub struct Touch {
     pub path: PathBuf,
     pub writes: bool,
+    /// Transcript position of the tool call; `None` for working directories seen in processes.
+    pub at: Option<u64>,
 }
 
 /// A tool call reduced to what matters for repo detection, independent of the agent.
@@ -342,14 +365,14 @@ fn claude_call<'a>(name: &Value, input: &'a Value) -> Call<'a> {
 /// or globs; callers resolve them to repos by walking ancestors.
 fn call_touches(call: &Call, base: &Path) -> Vec<Touch> {
     let touches = |paths: &[&str], base: &Path, writes: bool| -> Vec<Touch> {
-        paths.iter().filter_map(|p| resolve(p, base)).map(|path| Touch { path, writes }).collect()
+        paths.iter().filter_map(|p| resolve(p, base)).map(|path| Touch { path, writes, at: None }).collect()
     };
     match call {
         Call::Shell { command, cwd } => {
             let tokens = shell_tokens(command);
             let dir = cwd.and_then(|c| resolve(c, base)).unwrap_or_else(|| base.to_path_buf());
             let writes = git_writes(&tokens);
-            let mut found = vec![Touch { path: dir.clone(), writes }];
+            let mut found = vec![Touch { path: dir.clone(), writes, at: None }];
             found.extend(touches(&command_dirs(&tokens), &dir, writes));
             found
         }
@@ -516,6 +539,26 @@ mod tests {
     fn append(file: &Path, text: &str) {
         let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
         std::io::Write::write_all(&mut f, text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn touches_are_positioned_after_everything_read_before_them() {
+        let call = |p: &str| {
+            format!(r#"{{"type":"message","message":{{"content":[{{"type":"toolCall","name":"read","arguments":{{"path":"{p}"}}}}]}}}}"#)
+        };
+        let (mut t, file) = transcript("positions", Format::Omp, &format!("{}\n{}\n", call("/r/a"), call("/r/b")));
+        let first = t.poll().unwrap().touches;
+        // A dismissal now records this position; replaying the same lines later (sidebar
+        // restart) yields the same positions, none past it.
+        let dismissed_at = t.position();
+        assert!(first.iter().all(|touch| touch.at.is_some_and(|at| at <= dismissed_at)));
+        append(&file, &format!("{}\n", call("/r/a")));
+        let later = t.poll().unwrap().touches;
+        assert!(later.iter().all(|touch| touch.at.is_some_and(|at| at > dismissed_at)), "{later:?}");
+        let mut replay = Transcript::new(Format::Omp, file.display().to_string(), PathBuf::new());
+        let ats: Vec<_> = replay.poll().unwrap().touches.iter().filter_map(|touch| touch.at).collect();
+        assert_eq!(ats.iter().filter(|at| **at > dismissed_at).count(), 1, "only the new call is after the dismissal");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
     #[test]

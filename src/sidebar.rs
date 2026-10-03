@@ -7,7 +7,7 @@ use crate::git::{self, Change, LineStat, RepoStatus};
 use crate::github::{self, Checks, PrFile, PrRef, PrState, PrStatus};
 use crate::herdr::{self, PaneInfo};
 use crate::repos;
-use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
+use crate::state::{self, DismissedRepo, PrRecord, RepoRecord, SessionRepos};
 use crate::transcript::{Format, Touch, Transcript};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -60,6 +60,8 @@ struct Model {
     me: String,
     /// First rendered row on screen when the list is taller than the pane.
     scroll: usize,
+    /// Right-click menu, while open.
+    menu: Option<Menu>,
 }
 
 /// What a sidebar row is: selecting or clicking it shows its diff.
@@ -71,6 +73,8 @@ enum Click {
     Pr { url: String },
     /// One file of an expanded pull request.
     PrFile { url: String, path: String },
+    /// A file changed by commits not yet pushed.
+    Unpushed { root: PathBuf, path: String },
 }
 
 /// Identity of a selectable row that survives refreshes (a file's status code may change).
@@ -79,6 +83,7 @@ enum Key {
     File(PathBuf, String),
     Pr(String),
     PrFile(String, String),
+    Unpushed(PathBuf, String),
 }
 
 impl Click {
@@ -87,6 +92,7 @@ impl Click {
             Click::File { root, change } => Key::File(root.clone(), change.path.clone()),
             Click::Pr { url } => Key::Pr(url.clone()),
             Click::PrFile { url, path } => Key::PrFile(url.clone(), path.clone()),
+            Click::Unpushed { root, path } => Key::Unpushed(root.clone(), path.clone()),
         }
     }
 
@@ -95,14 +101,47 @@ impl Click {
             Click::File { root, change } => DiffRequest::local(root, change),
             Click::Pr { url } => DiffRequest::Pr { url: url.clone(), path: None },
             Click::PrFile { url, path } => DiffRequest::Pr { url: url.clone(), path: Some(path.clone()) },
+            Click::Unpushed { root, path } => DiffRequest::Unpushed { root: root.clone(), path: path.clone() },
         }
     }
 }
 
-/// All rendered rows plus the click target of each clickable row (by row index).
+/// What a right-click menu acts on: a repo header, or a pull request row.
+#[derive(Debug, Clone, PartialEq)]
+enum Target {
+    Repo(PathBuf),
+    Pr(PrRef),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MenuItem {
+    OpenPr,
+    Dismiss,
+}
+
+/// An open right-click menu, anchored below (or above) the on-screen row it was opened on.
+struct Menu {
+    target: Target,
+    row: usize,
+}
+
+impl Menu {
+    /// Items with the on-screen rows they occupy in a `rows`-high pane.
+    fn placed(&self, rows: usize) -> Vec<(usize, MenuItem, &'static str)> {
+        let items: &[(MenuItem, &str)] = match self.target {
+            Target::Repo(_) => &[(MenuItem::Dismiss, "dismiss repo")],
+            Target::Pr(_) => &[(MenuItem::OpenPr, "open on GitHub"), (MenuItem::Dismiss, "dismiss PR")],
+        };
+        let start = if self.row + 1 + items.len() <= rows { self.row + 1 } else { self.row.saturating_sub(items.len()) };
+        items.iter().enumerate().map(|(i, (item, label))| (start + i, *item, *label)).collect()
+    }
+}
+
+/// All rendered rows plus, by row index, what clicking and right-clicking each row acts on.
 struct Screen {
     lines: Vec<Line>,
     clicks: HashMap<usize, Click>,
+    menus: HashMap<usize, Target>,
 }
 
 impl Screen {
@@ -119,11 +158,26 @@ impl Screen {
     }
 }
 
-/// The part of a [`Screen`] that fits the pane; clicks keyed by on-screen row.
+/// The part of a [`Screen`] that fits the pane; clicks and menus keyed by on-screen row.
 struct View {
     lines: Vec<Line>,
     clicks: HashMap<usize, Click>,
+    menus: HashMap<usize, Target>,
     highlight: Option<usize>,
+}
+
+impl View {
+    /// Draws the open menu over the rows it occupies.
+    fn overlay(&mut self, menu: &Menu, cols: usize, rows: usize) {
+        for (row, _, label) in menu.placed(rows) {
+            while self.lines.len() <= row {
+                self.lines.push(Vec::new());
+            }
+            let text = fit_end(&format!(" ▸ {label}"), cols);
+            let pad = " ".repeat(cols.saturating_sub(text.width()));
+            self.lines[row] = vec![(format!("{text}{pad}"), Tone::Menu)];
+        }
+    }
 }
 
 struct PrBatch {
@@ -133,6 +187,8 @@ struct PrBatch {
 
 pub fn run() -> Result<()> {
     let me = std::env::var("HERDR_PANE_ID").map_err(|_| anyhow!("HERDR_PANE_ID not set"))?;
+    // herdr shows its own pane menu on right-click unless the pane asks for the clicks.
+    herdr::forward_right_click(&me)?;
     let _term = crate::term::Term::enter()?;
     event_loop(&me)
 }
@@ -184,7 +240,10 @@ fn event_loop(me: &str) -> Result<()> {
         let (cols, rows) = terminal::size()?;
         let screen = render(&model, usize::from(cols));
         let selected_row = screen.row_of(model.selected.as_ref());
-        let view = window(&screen, usize::from(cols), usize::from(rows), &mut model.scroll, selected_row);
+        let mut view = window(&screen, usize::from(cols), usize::from(rows), &mut model.scroll, selected_row);
+        if let Some(menu) = &model.menu {
+            view.overlay(menu, usize::from(cols), usize::from(rows));
+        }
         if (&view.lines, view.highlight) != (&shown.0, shown.1) {
             draw(&view, usize::from(cols))?;
             shown = (view.lines.clone(), view.highlight);
@@ -199,19 +258,44 @@ fn event_loop(me: &str) -> Result<()> {
             Err(TryRecvError::Disconnected) => false,
         });
         if event::poll(next_sample.min(next_git).saturating_duration_since(Instant::now()))? {
-            let result = match event::read()? {
-                Event::Key(KeyEvent { code, .. }) => handle_key(&mut model, &screen, code),
-                Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, modifiers, .. }) => {
+            let event = event::read()?;
+            let result = match (model.menu.take(), event) {
+                // An open menu takes the next click or key: an item runs, anything else closes it.
+                (Some(menu), Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, .. })) => {
+                    match menu.placed(usize::from(rows)).into_iter().find(|(r, ..)| *r == usize::from(row)) {
+                        Some((_, item, _)) => run_menu(&mut model, &menu.target, item),
+                        None => Ok(()),
+                    }
+                }
+                // A right-click elsewhere opens a menu there instead (arm below).
+                (Some(_), Event::Key(_) | Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Middle), .. })) => {
+                    Ok(())
+                }
+                (menu @ Some(_), Event::Mouse(_)) => {
+                    model.menu = menu;
+                    Ok(())
+                }
+                (_, Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Right), row, .. })) => {
+                    let row = usize::from(row);
+                    model.menu = view.menus.get(&row).map(|target| Menu { target: target.clone(), row });
+                    Ok(())
+                }
+                (_, Event::Key(KeyEvent { code, .. })) => handle_key(&mut model, &screen, code),
+                (_, Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, modifiers, .. })) => {
                     match view.clicks.get(&usize::from(row)) {
                         Some(click) => handle_click(&mut model, click, modifiers.contains(KeyModifiers::CONTROL)),
                         None => Ok(()),
                     }
                 }
-                Event::Resize(..) => {
+                (menu, Event::Resize(..)) => {
+                    model.menu = menu;
                     shown = (Vec::new(), None);
                     crate::dock::hold_width(&model.me)
                 }
-                _ => Ok(()),
+                (menu, _) => {
+                    model.menu = menu;
+                    Ok(())
+                }
             };
             if let Err(e) = result {
                 model.error = Some(format!("{e:#}"));
@@ -300,6 +384,42 @@ fn expand(model: &mut Model, url: String) {
         let _ = tx.send((url, files));
     });
     model.files_jobs.push(rx);
+}
+
+fn run_menu(model: &mut Model, target: &Target, item: MenuItem) -> Result<()> {
+    match (item, target) {
+        (MenuItem::OpenPr, Target::Pr(pr)) => open_url(&pr.url()),
+        (MenuItem::Dismiss, target) => dismiss(model, target),
+        (MenuItem::OpenPr, Target::Repo(_)) => Ok(()),
+    }
+}
+
+/// Hides a pull request from this chat's sidebar for good, or a repo (with its pull requests)
+/// until the chat touches it again.
+fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
+    let Some(session) = model.session.as_mut() else { return Ok(()) };
+    let at = session.transcript.as_ref().map_or(0, Transcript::position);
+    let repos = &mut session.repos;
+    match target {
+        Target::Repo(root) if !is_dismissed(repos, root) => repos.dismissed_repos.push(DismissedRepo { root: root.clone(), at }),
+        Target::Pr(pr) if !repos.dismissed_prs.iter().any(|d| d.same(pr)) => repos.dismissed_prs.push(pr.clone()),
+        _ => return Ok(()),
+    }
+    if session.persisted {
+        state::save_session(&session.repos)?;
+    }
+    Ok(())
+}
+
+fn is_dismissed(repos: &SessionRepos, root: &Path) -> bool {
+    repos.dismissed_repos.iter().any(|d| d.root == root)
+}
+
+/// Pull requests still shown: not dismissed, and not under a dismissed repo.
+fn visible_prs(repos: &SessionRepos) -> impl Iterator<Item = &PrRecord> {
+    repos.prs.iter().filter(|p| {
+        !repos.dismissed_prs.iter().any(|d| d.same(&p.pr)) && !p.root.as_ref().is_some_and(|root| is_dismissed(repos, root))
+    })
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -401,12 +521,19 @@ fn sample(me: &str, model: &mut Model) -> Result<bool> {
     if let Some(pid) = herdr::pane_process_info(&target.pane_id)?.shell_pid {
         observed.extend(repos::process_tree_cwds(pid));
     }
-    touches.extend(observed.into_iter().map(|path| Touch { path, writes: false }));
+    touches.extend(observed.into_iter().map(|path| Touch { path, writes: false, at: None }));
 
-    let SessionRepos { repos: records, prs, .. } = &mut session.repos;
+    let SessionRepos { repos: records, prs, dismissed_repos, .. } = &mut session.repos;
     let mut dirty = false;
     for touch in touches {
         let Some(root) = repos::repo_root(&touch.path) else { continue };
+        // A tool call after the dismissal brings a dismissed repo back; the agent merely
+        // sitting in it (process working dirs) does not.
+        if let Some(at) = touch.at {
+            let before = dismissed_repos.len();
+            dismissed_repos.retain(|d| !(d.root == root && d.at < at));
+            dirty |= dismissed_repos.len() != before;
+        }
         match records.iter_mut().find(|r| r.root == root) {
             Some(record) if touch.writes && !record.changed => {
                 record.changed = true;
@@ -453,17 +580,14 @@ fn sample(me: &str, model: &mut Model) -> Result<bool> {
 
 fn has_unfetched_pr(model: &Model) -> bool {
     model.session.as_ref().is_some_and(|s| {
-        s.repos.prs.iter().any(|p| p.status.is_none() && !model.pr_errors.contains_key(&p.pr.url()))
+        visible_prs(&s.repos).any(|p| p.status.is_none() && !model.pr_errors.contains_key(&p.pr.url()))
     })
 }
 
 /// Fetches every non-final PR's status on a background thread.
 fn start_pr_refresh(model: &Model) -> Option<Receiver<PrBatch>> {
     let session = model.session.as_ref()?;
-    let todo: Vec<PrRef> = session
-        .repos
-        .prs
-        .iter()
+    let todo: Vec<PrRef> = visible_prs(&session.repos)
         .filter(|p| !p.status.is_some_and(|s| s.state.is_final()))
         .map(|p| p.pr.clone())
         .collect();
@@ -564,6 +688,8 @@ enum Tone {
     Merged,
     /// Clickable text (an OSC 8 hyperlink); underlined so it reads as a link.
     Link,
+    /// An entry of the right-click menu.
+    Menu,
 }
 
 type Line = Vec<(String, Tone)>;
@@ -571,27 +697,30 @@ type Line = Vec<(String, Tone)>;
 fn render(model: &Model, cols: usize) -> Screen {
     let mut lines: Vec<Line> = Vec::new();
     let mut clicks: HashMap<usize, Click> = HashMap::new();
+    let mut menus: HashMap<usize, Target> = HashMap::new();
     if let Some(err) = &model.error {
         lines.push(vec![(fit_end(&format!("! {err}"), cols), Tone::Error)]);
     }
     let Some(session) = &model.session else {
         lines.push(vec![(fit_end("no agent in this tab", cols), Tone::Dim)]);
-        return Screen { lines, clicks };
+        return Screen { lines, clicks, menus };
     };
     if !session.title.is_empty() {
         lines.push(vec![(fit_end(&session.title, cols), Tone::Dim)]);
     }
     // Repos the chat changed or has pull requests in (`refresh_git` skips deleted ones), then
-    // PRs whose repo has no touched checkout.
-    let has_prs = |root: &PathBuf| session.repos.prs.iter().any(|p| p.root.as_ref() == Some(root));
+    // PRs whose repo has no touched checkout. Whatever the user dismissed stays hidden.
+    let prs: Vec<&PrRecord> = visible_prs(&session.repos).collect();
+    let has_prs = |root: &PathBuf| prs.iter().any(|p| p.root.as_ref() == Some(root));
     let shown: Vec<&PathBuf> = session
         .repos
         .repos
         .iter()
         .filter(|r| (r.changed || has_prs(&r.root)) && model.statuses.contains_key(&r.root))
+        .filter(|r| !is_dismissed(&session.repos, &r.root))
         .map(|r| &r.root)
         .collect();
-    let orphans: Vec<&PrRecord> = session.repos.prs.iter().filter(|p| p.root.is_none()).collect();
+    let orphans: Vec<&PrRecord> = prs.iter().copied().filter(|p| p.root.is_none()).collect();
     if shown.is_empty() && orphans.is_empty() {
         lines.push(vec![(fit_end("no changes yet", cols), Tone::Dim)]);
     }
@@ -599,18 +728,25 @@ fn render(model: &Model, cols: usize) -> Screen {
         if !lines.is_empty() {
             lines.push(Vec::new());
         }
+        menus.insert(lines.len(), Target::Repo(root.clone()));
         lines.push(repo_header(root, model.statuses.get(root), cols));
-        for pr in session.repos.prs.iter().filter(|p| p.root.as_ref() == Some(root)) {
-            push_pr(&mut lines, &mut clicks, model, pr, cols);
+        for pr in prs.iter().filter(|p| p.root.as_ref() == Some(root)) {
+            push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols);
         }
         match model.statuses.get(root) {
             None => {}
             Some(Err(e)) => lines.push(vec![(fit_end(&format!(" ! {e}"), cols), Tone::Error)]),
             Some(Ok(s)) => {
+                // Uncommitted changes (two-letter `git status` codes), then what unpushed
+                // commits change (`↑`).
                 for change in &s.changes {
                     let code = String::from_utf8_lossy(&change.code).into_owned();
                     clicks.insert(lines.len(), Click::File { root: root.clone(), change: change.clone() });
                     lines.push(file_row(" ", (code, change_tone(change.code)), &change.display(), change.stat, cols));
+                }
+                for (path, stat) in &s.unpushed {
+                    clicks.insert(lines.len(), Click::Unpushed { root: root.clone(), path: path.clone() });
+                    lines.push(file_row(" ", ("↑ ".into(), Tone::Branch), path, Some(*stat), cols));
                 }
             }
         }
@@ -619,17 +755,26 @@ fn render(model: &Model, cols: usize) -> Screen {
         if !lines.is_empty() {
             lines.push(Vec::new());
         }
+        menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
         lines.push(vec![(fit_end(&format!("{}/{}", pr.pr.owner, pr.pr.repo), cols), Tone::Repo)]);
-        push_pr(&mut lines, &mut clicks, model, pr, cols);
+        push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols);
     }
-    Screen { lines, clicks }
+    Screen { lines, clicks, menus }
 }
 
 /// A pull request row and, when expanded, one row per file it changes.
-fn push_pr(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, model: &Model, pr: &PrRecord, cols: usize) {
+fn push_pr(
+    lines: &mut Vec<Line>,
+    clicks: &mut HashMap<usize, Click>,
+    menus: &mut HashMap<usize, Target>,
+    model: &Model,
+    pr: &PrRecord,
+    cols: usize,
+) {
     let url = pr.pr.url();
     let expanded = model.expanded.contains(&url);
     clicks.insert(lines.len(), Click::Pr { url: url.clone() });
+    menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
     lines.push(pr_line(pr, model.pr_errors.get(&url), expanded, cols));
     if !expanded {
         return;
@@ -717,24 +862,26 @@ fn hyperlink(url: &str, text: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
+/// `name branch ↑1 ↓2`: a long branch name is shortened, never the ahead/behind counts.
 fn repo_header(root: &Path, status: Option<&Result<RepoStatus, String>>, cols: usize) -> Line {
     let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-    let mut branch = String::new();
-    if let Some(Ok(s)) = status {
-        branch = s.branch.clone();
-        if s.ahead > 0 {
-            branch.push_str(&format!(" ↑{}", s.ahead));
-        }
-        if s.behind > 0 {
-            branch.push_str(&format!(" ↓{}", s.behind));
-        }
-    }
     let name = fit_end(&name, cols);
-    let room = cols.saturating_sub(name.width() + 1);
-    if branch.is_empty() || room < 2 {
-        return vec![(name, Tone::Repo)];
+    let Some(Ok(s)) = status else { return vec![(name, Tone::Repo)] };
+    let tracking: String = [(s.ahead, '↑'), (s.behind, '↓')]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, arrow)| format!(" {arrow}{n}"))
+        .collect();
+    let room = cols.saturating_sub(name.width() + 1 + tracking.width());
+    let mut line = vec![(name, Tone::Repo)];
+    if room >= 2 {
+        line.push((" ".into(), Tone::Plain));
+        line.push((fit_end(&s.branch, room), Tone::Branch));
     }
-    vec![(name, Tone::Repo), (" ".into(), Tone::Plain), (fit_end(&branch, room), Tone::Branch)]
+    if !tracking.is_empty() {
+        line.push((tracking, Tone::Waiting));
+    }
+    line
 }
 
 fn change_tone(code: [u8; 2]) -> Tone {
@@ -747,12 +894,17 @@ fn change_tone(code: [u8; 2]) -> Tone {
 }
 
 /// The rows that fit a `rows`-high pane. Scrolls so `selected` stays visible; when rows are
-/// left below, the last line counts them instead. Clicks are re-keyed to on-screen rows.
+/// left below, the last line counts them instead. Clicks and menus are re-keyed to on-screen rows.
 fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usize, selected: Option<usize>) -> View {
     let total = screen.lines.len();
     if total <= rows {
         *scroll = 0;
-        return View { lines: screen.lines.clone(), clicks: screen.clicks.clone(), highlight: selected };
+        return View {
+            lines: screen.lines.clone(),
+            clicks: screen.clicks.clone(),
+            menus: screen.menus.clone(),
+            highlight: selected,
+        };
     }
     let body = rows.saturating_sub(1);
     if let Some(row) = selected {
@@ -772,6 +924,7 @@ fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usize, selecte
     View {
         lines,
         clicks: screen.clicks.iter().filter_map(|(row, click)| Some((in_view(*row)?, click.clone()))).collect(),
+        menus: screen.menus.iter().filter_map(|(row, target)| Some((in_view(*row)?, target.clone()))).collect(),
         highlight: selected.and_then(in_view),
     }
 }
@@ -849,6 +1002,7 @@ fn style(out: &mut impl Write, tone: Tone) -> Result<()> {
     match tone {
         Tone::Plain => {}
         Tone::Link => queue!(out, SetAttribute(Attribute::Underlined))?,
+        Tone::Menu => queue!(out, SetAttribute(Attribute::Reverse), SetAttribute(Attribute::Bold))?,
         Tone::Dim => queue!(out, SetAttribute(Attribute::Dim))?,
         Tone::Repo => queue!(out, SetAttribute(Attribute::Bold))?,
         Tone::Branch => queue!(out, SetForegroundColor(Color::Cyan))?,
@@ -891,6 +1045,99 @@ mod tests {
     }
 
     #[test]
+    fn unpushed_work_stays_visible() {
+        let root = PathBuf::from("/r/e2e");
+        let status = RepoStatus {
+            branch: "nightly-maintenance-2026-09-29".into(),
+            ahead: 1,
+            behind: 2,
+            changes: vec![Change { code: *b" M", path: "a.py".into(), orig: None, stat: None }],
+            unpushed: vec![("e2e/b.py".into(), LineStat::Lines { added: 4, removed: 1 })],
+            fingerprint: 0,
+        };
+        // A long branch name gives way; the ahead/behind counts do not.
+        let header: String = repo_header(&root, Some(&Ok(status.clone())), 30).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(header, "e2e nightly-maintenance… ↑1 ↓2");
+        assert_eq!(header.width(), 30);
+        // Unpushed files are rows of their own, after the uncommitted ones.
+        let mut model = Model::default();
+        model.statuses.insert(root.clone(), Ok(status));
+        model.session = Some(Session {
+            pane_id: "w:p1".into(),
+            title: String::new(),
+            repos: SessionRepos {
+                session: "s".into(),
+                repos: vec![RepoRecord { root: root.clone(), changed: true, baseline: None }],
+                prs: Vec::new(),
+                ..SessionRepos::default()
+            },
+            persisted: false,
+            transcript: None,
+        });
+        let screen = render(&model, 40);
+        let rows: Vec<Key> = screen.rows().into_iter().map(|(_, c)| c.key()).collect();
+        assert_eq!(rows, [Key::File(root.clone(), "a.py".into()), Key::Unpushed(root.clone(), "e2e/b.py".into())]);
+        let unpushed = screen.rows()[1].1.diff_request();
+        assert_eq!(unpushed, DiffRequest::Unpushed { root, path: "e2e/b.py".into() });
+    }
+
+    #[test]
+    fn right_click_targets_and_dismissals() {
+        let (mine, reviewed) = (PathBuf::from("/r/mine"), PathBuf::from("/r/e2e"));
+        let pr = |repo: &str, number| PrRef { owner: "o".into(), repo: repo.into(), number };
+        let clean = || Ok(RepoStatus {
+            branch: "main".into(),
+            ahead: 0,
+            behind: 0,
+            changes: Vec::new(),
+            unpushed: Vec::new(),
+            fingerprint: 0,
+        });
+        let mut model = Model::default();
+        model.statuses.insert(mine.clone(), clean());
+        model.statuses.insert(reviewed.clone(), clean());
+        model.session = Some(Session {
+            pane_id: "w:p1".into(),
+            title: String::new(),
+            repos: SessionRepos {
+                session: "s".into(),
+                repos: vec![
+                    RepoRecord { root: mine.clone(), changed: true, baseline: None },
+                    RepoRecord { root: reviewed.clone(), changed: false, baseline: None },
+                ],
+                prs: vec![
+                    PrRecord { pr: pr("e2e", 36), root: Some(reviewed.clone()), status: None },
+                    PrRecord { pr: pr("infra", 133), root: None, status: None },
+                ],
+                ..SessionRepos::default()
+            },
+            persisted: false,
+            transcript: None,
+        });
+        // Rows: 0 mine, 1 blank, 2 e2e, 3 #36, 4 blank, 5 o/infra, 6 #133.
+        let screen = render(&model, 40);
+        assert_eq!(screen.menus.get(&0), Some(&Target::Repo(mine.clone())));
+        assert_eq!(screen.menus.get(&2), Some(&Target::Repo(reviewed.clone())));
+        assert_eq!(screen.menus.get(&3), Some(&Target::Pr(pr("e2e", 36))));
+        assert_eq!(screen.menus.get(&5), Some(&Target::Pr(pr("infra", 133))), "a PR's own heading");
+        assert_eq!(screen.menus.get(&6), Some(&Target::Pr(pr("infra", 133))));
+
+        // The menu opens below the clicked row, or above it at the bottom of the pane.
+        let below = Menu { target: Target::Pr(pr("infra", 133)), row: 3 };
+        assert_eq!(below.placed(10).iter().map(|(r, i, _)| (*r, *i)).collect::<Vec<_>>(), [(4, MenuItem::OpenPr), (5, MenuItem::Dismiss)]);
+        let above = Menu { target: Target::Pr(pr("infra", 133)), row: 9 };
+        assert_eq!(above.placed(10).iter().map(|(r, ..)| *r).collect::<Vec<_>>(), [7, 8]);
+
+        // Dismissing #36 also hides its repo, which was only shown for that PR; dismissing a
+        // repo hides it even though the chat changed it.
+        run_menu(&mut model, &Target::Pr(pr("E2E", 36)), MenuItem::Dismiss).unwrap();
+        run_menu(&mut model, &Target::Repo(mine.clone()), MenuItem::Dismiss).unwrap();
+        let text: String = render(&model, 40).lines.iter().flatten().map(|(t, _)| format!("{t}\n")).collect();
+        assert!(!text.contains("mine") && !text.contains("e2e") && !text.contains("#36"), "{text}");
+        assert!(text.contains("o/infra") && text.contains("#133"), "{text}");
+    }
+
+    #[test]
     fn change_codes_map_to_git_colors() {
         assert_eq!(change_tone(*b"M "), Tone::Staged);
         assert_eq!(change_tone(*b" M"), Tone::Unstaged);
@@ -912,6 +1159,7 @@ mod tests {
                 ahead: 0,
                 behind: 0,
                 changes: vec![change(b" M", "a.rs"), change(b"??", "b.rs")],
+                unpushed: Vec::new(),
                 fingerprint: 0,
             }),
         );
@@ -922,6 +1170,7 @@ mod tests {
                 session: "s".into(),
                 repos: vec![RepoRecord { root: root.clone(), changed: true, baseline: None }],
                 prs: vec![PrRecord { pr: pr.clone(), root: Some(root.clone()), status: None }],
+                ..SessionRepos::default()
             },
             persisted: false,
             transcript: None,

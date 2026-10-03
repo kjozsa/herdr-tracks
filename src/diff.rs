@@ -33,6 +33,8 @@ const WHEEL_LINES: usize = 3;
 pub enum DiffRequest {
     /// A changed file in a local checkout: staged and unstaged changes together.
     Local { root: PathBuf, path: String, orig: Option<String>, untracked: bool },
+    /// What the unpushed commits change in one file of a local checkout (`@{u}...HEAD`).
+    Unpushed { root: PathBuf, path: String },
     /// A pull request's patch: one file of it, or all of it.
     Pr { url: String, path: Option<String> },
 }
@@ -145,7 +147,9 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
 /// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
 fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut PrPatches) -> Vec<String> {
     let (patch, repo) = match request {
-        DiffRequest::Local { root, .. } => (local_patch(request, root), Some(root.as_path())),
+        DiffRequest::Local { root, .. } | DiffRequest::Unpushed { root, .. } => {
+            (local_patch(request, root), Some(root.as_path()))
+        }
         DiffRequest::Pr { url, path } => (pr_patch(patches, url, path.as_deref()), None),
     };
     let patch = match patch {
@@ -241,18 +245,25 @@ fn colorize(patch: &str) -> String {
     out
 }
 
-/// Staged and unstaged changes together (`git diff HEAD`); untracked files as all-new.
+/// Local changes: staged and unstaged together (`git diff HEAD`), untracked files as all-new;
+/// unpushed commits: what a push would add (`@{u}...HEAD`).
 fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
-    let DiffRequest::Local { path, orig, untracked, .. } = request else { return Vec::new() };
     let mut args: Vec<String> = vec!["diff".into(), "--color=never".into()];
-    if *untracked {
-        args.extend(["--no-index", "--", "/dev/null"].map(String::from));
-    } else {
-        // Before the first commit there is no HEAD: show what is staged.
-        args.extend([if has_head { "HEAD" } else { "--cached" }, "-M", "--"].map(String::from));
-        args.extend(orig.clone());
+    match request {
+        DiffRequest::Local { path, untracked: true, .. } => {
+            args.extend(["--no-index", "--", "/dev/null", path.as_str()].map(String::from));
+        }
+        DiffRequest::Local { path, orig, .. } => {
+            // Before the first commit there is no HEAD: show what is staged.
+            args.extend([if has_head { "HEAD" } else { "--cached" }, "-M", "--"].map(String::from));
+            args.extend(orig.clone());
+            args.push(path.clone());
+        }
+        DiffRequest::Unpushed { path, .. } => {
+            args.extend(["-M", "@{u}...HEAD", "--", path.as_str()].map(String::from));
+        }
+        DiffRequest::Pr { .. } => return Vec::new(),
     }
-    args.push(path.clone());
     args
 }
 
@@ -284,6 +295,8 @@ mod tests {
         assert_eq!(args(&local("new.rs", Some("old.rs"), false), true), ["HEAD", "-M", "--", "old.rs", "new.rs"]);
         assert_eq!(args(&local("n.md", None, true), true), ["--no-index", "--", "/dev/null", "n.md"]);
         assert_eq!(args(&local("a.rs", None, false), false), ["--cached", "-M", "--", "a.rs"]);
+        let unpushed = DiffRequest::Unpushed { root: "/r".into(), path: "a.rs".into() };
+        assert_eq!(args(&unpushed, true), ["-M", "@{u}...HEAD", "--", "a.rs"]);
     }
 
     #[test]

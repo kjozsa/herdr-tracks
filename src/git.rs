@@ -46,6 +46,9 @@ pub struct RepoStatus {
     pub ahead: u32,
     pub behind: u32,
     pub changes: Vec<Change>,
+    /// Files changed by commits not yet pushed to the upstream branch, with line counts:
+    /// what a push would add (`@{u}...HEAD`). Empty without an upstream.
+    pub unpushed: Vec<(String, LineStat)>,
     /// Hash of HEAD plus every status entry (with index blob ids). Upstream tracking is left
     /// out, so fetches and pushes do not count as local changes.
     pub fingerprint: u64,
@@ -69,28 +72,22 @@ pub fn status(root: &Path) -> Result<RepoStatus, String> {
     for change in &mut status.changes {
         change.stat = if change.untracked() { count_lines(&root.join(&change.path)) } else { stats.get(&change.path).copied() };
     }
+    if status.ahead > 0 && text.contains("# branch.upstream ") {
+        let mut unpushed: Vec<_> = diff_numstat(root, &["@{u}...HEAD"]).into_iter().collect();
+        unpushed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        status.unpushed = unpushed;
+    }
     Ok(status)
 }
 
 /// Line counts of every changed tracked file against HEAD; before the first commit, staged
 /// plus unstaged changes.
 fn numstat(root: &Path, unborn: bool) -> HashMap<String, LineStat> {
-    let run = |args: &[&str]| {
-        Command::new("git")
-            .arg("--no-optional-locks")
-            .arg("-C")
-            .arg(root)
-            .args(["-c", "core.quotePath=false", "diff", "--numstat", "-z", "-M"])
-            .args(args)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
-    };
     if !unborn {
-        return parse_numstat(&run(&["HEAD"]));
+        return diff_numstat(root, &["HEAD"]);
     }
-    let mut stats = parse_numstat(&run(&["--cached"]));
-    for (path, stat) in parse_numstat(&run(&[])) {
+    let mut stats = diff_numstat(root, &["--cached"]);
+    for (path, stat) in diff_numstat(root, &[]) {
         let merged = match (stats.get(&path), stat) {
             (Some(LineStat::Lines { added: a, removed: r }), LineStat::Lines { added, removed }) => {
                 LineStat::Lines { added: a + added, removed: r + removed }
@@ -101,6 +98,19 @@ fn numstat(root: &Path, unborn: bool) -> HashMap<String, LineStat> {
         stats.insert(path, merged);
     }
     stats
+}
+
+fn diff_numstat(root: &Path, args: &[&str]) -> HashMap<String, LineStat> {
+    let out = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "core.quotePath=false", "diff", "--numstat", "-z", "-M"])
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    parse_numstat(&out)
 }
 
 /// `git diff --numstat -z`: `added\tremoved\tpath\0`, or `added\tremoved\t\0old\0new\0` for
@@ -145,7 +155,14 @@ fn count_lines(path: &Path) -> Option<LineStat> {
 }
 
 fn parse(text: &str) -> RepoStatus {
-    let mut s = RepoStatus { branch: String::new(), ahead: 0, behind: 0, changes: Vec::new(), fingerprint: FNV_OFFSET };
+    let mut s = RepoStatus {
+        branch: String::new(),
+        ahead: 0,
+        behind: 0,
+        changes: Vec::new(),
+        unpushed: Vec::new(),
+        fingerprint: FNV_OFFSET,
+    };
     for line in text.lines() {
         if let Some(header) = line.strip_prefix("# ") {
             let (key, value) = header.split_once(' ').unwrap_or((header, ""));
