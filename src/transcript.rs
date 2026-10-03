@@ -262,7 +262,7 @@ fn gh_pr_refs(command: &str) -> Vec<PrMention> {
     const VALUED: &[&str] =
         &["-R", "--repo", "--json", "--jq", "-q", "-t", "--template", "-b", "--body", "-F", "--body-file"];
     let mut found = Vec::new();
-    for segment in command.split(|c| matches!(c, ';' | '|' | '&' | '\n' | '(' | ')')) {
+    for segment in command.split([';', '|', '&', '\n', '(', ')']) {
         let tokens: Vec<&str> = segment.split_whitespace().collect();
         let Some(at) = tokens.windows(3).position(|w| w[0] == "gh" && w[1] == "pr" && VERBS.contains(&w[2])) else {
             continue;

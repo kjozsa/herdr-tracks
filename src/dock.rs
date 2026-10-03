@@ -85,13 +85,19 @@ fn closed_sidebar_tab(tabs: &BTreeMap<String, String>) -> Option<String> {
     tabs.iter().find(|(_, pane)| pane.as_str() == closed).map(|(tab, _)| tab.clone())
 }
 
-/// Startup hook: forget sidebars that did not survive the restart, so their tabs dock again.
+/// Startup hook: forget sidebars that did not survive the restart, so their tabs dock again,
+/// and delete plugin files nothing uses any more.
 pub fn startup() -> Result<()> {
     let mut guard = DockGuard::acquire()?;
     let panes = herdr::pane_list()?;
     let live: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
     guard.state.tabs.retain(|_, pane| live.contains(pane.as_str()));
-    guard.save()
+    guard.save()?;
+    let pane_ids: Vec<&str> = live.into_iter().collect();
+    let sessions: Vec<&str> = panes.iter().filter_map(|p| p.agent_session.as_ref()).map(|s| s.value.as_str()).collect();
+    let removed = crate::state::prune(&pane_ids, &sessions)?;
+    println!("startup: removed {removed} stale file(s)");
+    Ok(())
 }
 
 /// A sidebar process already running in one of `panes` (state lost or never recorded).
@@ -223,7 +229,7 @@ fn resolve_width(live: Option<u32>, ui: Option<&toml::Table>) -> u32 {
 fn herdr_runtime_dir() -> PathBuf {
     std::env::var_os("HERDR_SOCKET_PATH")
         .and_then(|s| PathBuf::from(s).parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| config_dir())
+        .unwrap_or_else(config_dir)
 }
 
 fn config_dir() -> PathBuf {

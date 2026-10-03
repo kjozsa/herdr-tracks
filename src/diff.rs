@@ -94,12 +94,11 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
     let mut next_owner_check = Instant::now() + OWNER_CHECK;
     loop {
         let (cols, rows) = terminal::size()?;
-        if let Ok(text) = std::fs::read_to_string(file) {
-            if text != request_text {
+        if let Ok(text) = std::fs::read_to_string(file)
+            && text != request_text {
                 request_text = text;
                 scroll = 0;
             }
-        }
         if rendered.as_ref() != Some(&(request_text.clone(), cols)) {
             lines = match serde_json::from_str::<DiffRequest>(&request_text) {
                 Ok(request) => diff_lines(&request, cols, &mut patches),

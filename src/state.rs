@@ -119,3 +119,29 @@ pub fn save_session(repos: &SessionRepos) -> Result<()> {
     }
     write_atomic(&path, &serde_json::to_vec_pretty(repos)?)
 }
+
+/// Session files untouched for this long belong to chats that are over.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Deletes plugin files nothing uses any more: diff requests of panes that are gone, and
+/// session files of chats untouched for 30 days that no open pane belongs to.
+pub fn prune(live_panes: &[&str], live_sessions: &[&str]) -> Result<usize> {
+    let keep_diffs: Vec<PathBuf> = live_panes.iter().map(|p| crate::diff::request_file(p)).collect();
+    let keep_sessions: Vec<PathBuf> = live_sessions.iter().map(|s| session_file(s)).collect();
+    let mut removed = 0;
+    for (dir, keep, stale) in [
+        (state_dir().join("diff"), keep_diffs, None),
+        (state_dir().join("sessions"), keep_sessions, Some(SESSION_TTL)),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let old = |ttl| entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > ttl));
+            if !keep.contains(&path) && stale.is_none_or(old) {
+                std::fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
