@@ -3,7 +3,7 @@
 use crate::herdr::{self, Layout, PaneInfo};
 use crate::state::DockGuard;
 use anyhow::{anyhow, bail, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 /// herdr's defaults for `[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`.
@@ -42,8 +42,12 @@ pub fn show() -> Result<()> {
 
 fn place(without_agent: bool) -> Result<()> {
     let mut guard = DockGuard::acquire()?;
-    let tab = match closed_sidebar_tab(&guard.state.tabs) {
-        Some(tab) => tab,
+    let tab = match closed_pane() {
+        // Only a closed sidebar matters; other panes close all the time.
+        Some(closed) => match guard.state.tabs.iter().find(|(_, pane)| **pane == closed) {
+            Some((tab, _)) => tab.clone(),
+            None => return Ok(()),
+        },
         None => context_tab()?,
     };
     let panes = herdr::pane_list()?;
@@ -54,9 +58,16 @@ fn place(without_agent: bool) -> Result<()> {
     if guard.state.tabs.len() != known {
         guard.save()?;
     }
-    let tab_panes: Vec<&PaneInfo> = panes.iter().filter(|p| p.tab_id == tab).collect();
-    if guard.state.tabs.get(&tab).is_some_and(|id| tab_panes.iter().any(|p| &p.pane_id == id)) {
-        return Ok(());
+    let mut tab_panes: Vec<&PaneInfo> = panes.iter().filter(|p| p.tab_id == tab).collect();
+    if let Some(id) = guard.state.tabs.get(&tab).filter(|id| tab_panes.iter().any(|p| &p.pane_id == *id)).cloned() {
+        if runs(&id, Mode::Sidebar)? {
+            return Ok(());
+        }
+        // herdr restores plugin panes as plain shells after a restart: replace this one.
+        guard.state.tabs.remove(&tab);
+        guard.save()?;
+        herdr::pane_close(&id)?;
+        tab_panes.retain(|p| p.pane_id != id);
     }
     if tab_panes.is_empty() || !(without_agent || tab_panes.iter().any(|p| p.agent.is_some())) {
         return Ok(());
@@ -73,44 +84,83 @@ fn place(without_agent: bool) -> Result<()> {
     guard.save()
 }
 
-/// For a `pane.closed` hook on a sidebar pane: the tab it was docked in. The event names only
-/// the pane, and herdr's context then describes whichever tab is focused.
-fn closed_sidebar_tab(tabs: &BTreeMap<String, String>) -> Option<String> {
+/// The pane a `pane.closed` hook is about. The event names only the pane: herdr's context then
+/// describes whichever tab is focused, so the tab comes from the dock state instead.
+fn closed_pane() -> Option<String> {
     let event: serde_json::Value = serde_json::from_str(&std::env::var("HERDR_PLUGIN_EVENT_JSON").ok()?).ok()?;
     let data = &event["data"];
-    if data["type"] != "pane_closed" {
-        return None;
-    }
-    let closed = data["pane_id"].as_str()?;
-    tabs.iter().find(|(_, pane)| pane.as_str() == closed).map(|(tab, _)| tab.clone())
+    (data["type"] == "pane_closed").then(|| data["pane_id"].as_str().map(str::to_string)).flatten()
 }
 
-/// Startup hook: forget sidebars that did not survive the restart, so their tabs dock again,
-/// and delete plugin files nothing uses any more.
+/// Startup hook. herdr restores panes after a restart, but plugin panes come back as plain
+/// shells: close every Tracks pane that no longer runs Tracks and dock fresh sidebars in the
+/// tabs that host an agent. Also deletes plugin files nothing uses any more.
 pub fn startup() -> Result<()> {
     let mut guard = DockGuard::acquire()?;
     let panes = herdr::pane_list()?;
-    let live: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
+    let mut closed = HashSet::new();
+    for pane in &panes {
+        let mode = match pane.label.as_deref() {
+            Some(SIDEBAR_TITLE) => Mode::Sidebar,
+            Some(DIFF_TITLE) => Mode::Diff,
+            _ => continue,
+        };
+        if !runs(&pane.pane_id, mode)? {
+            herdr::pane_close(&pane.pane_id)?;
+            closed.insert(pane.pane_id.as_str());
+        }
+    }
+    let live: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).filter(|id| !closed.contains(id)).collect();
     guard.state.tabs.retain(|_, pane| live.contains(pane.as_str()));
+    let panes: Vec<&PaneInfo> = panes.iter().filter(|p| live.contains(p.pane_id.as_str())).collect();
+    let agent_tabs: BTreeSet<&str> = panes.iter().filter(|p| p.agent.is_some()).map(|p| p.tab_id.as_str()).collect();
+    let mut docked = 0;
+    for tab in agent_tabs {
+        if guard.state.tabs.contains_key(tab) {
+            continue;
+        }
+        let tab_panes: Vec<&PaneInfo> = panes.iter().copied().filter(|p| p.tab_id == tab).collect();
+        if let Some(pane) = dock(&tab_panes)? {
+            guard.state.tabs.insert(tab.to_string(), pane);
+            docked += 1;
+        }
+    }
     guard.save()?;
     let pane_ids: Vec<&str> = live.into_iter().collect();
     let sessions: Vec<&str> = panes.iter().filter_map(|p| p.agent_session.as_ref()).map(|s| s.value.as_str()).collect();
     let removed = crate::state::prune(&pane_ids, &sessions)?;
-    println!("startup: removed {removed} stale file(s)");
+    println!("startup: replaced {} restored pane(s), docked {docked} sidebar(s), removed {removed} stale file(s)", closed.len());
     Ok(())
+}
+
+/// Manifest titles of the plugin's panes; herdr shows them as pane labels.
+const SIDEBAR_TITLE: &str = "tracks";
+const DIFF_TITLE: &str = "tracks diff";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    Sidebar,
+    Diff,
+}
+
+/// Whether the pane's foreground process is this plugin running in `mode`.
+fn runs(pane_id: &str, mode: Mode) -> Result<bool> {
+    let arg = match mode {
+        Mode::Sidebar => "pane",
+        Mode::Diff => "diff",
+    };
+    let info = herdr::pane_process_info(pane_id)?;
+    Ok(info.foreground_processes.iter().any(|p| {
+        let argv = p.argv.as_deref().unwrap_or_default();
+        let argv0 = p.argv0.as_deref().or(argv.first().map(String::as_str)).unwrap_or("");
+        Path::new(argv0).file_name().is_some_and(|f| f == crate::BIN_NAME) && argv.get(1).map(String::as_str) == Some(arg)
+    }))
 }
 
 /// A sidebar process already running in one of `panes` (state lost or never recorded).
 fn find_sidebar(panes: &[&PaneInfo]) -> Result<Option<String>> {
     for pane in panes {
-        let info = herdr::pane_process_info(&pane.pane_id)?;
-        let is_sidebar = info.foreground_processes.iter().any(|p| {
-            let argv = p.argv.as_deref().unwrap_or_default();
-            let argv0 = p.argv0.as_deref().or(argv.first().map(String::as_str)).unwrap_or("");
-            Path::new(argv0).file_name().is_some_and(|f| f == crate::BIN_NAME)
-                && argv.get(1).map(String::as_str) == Some("pane")
-        });
-        if is_sidebar {
+        if runs(&pane.pane_id, Mode::Sidebar)? {
             return Ok(Some(pane.pane_id.clone()));
         }
     }

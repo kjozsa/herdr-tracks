@@ -18,7 +18,7 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-tracks\" 
 # Diff viewer opened from the sidebar; follows the sidebar's selection in place. `q` closes it.
 [[panes]]
 id = "diff"
-title = "diff"
+title = "tracks diff"
 placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-tracks\" diff"]
 

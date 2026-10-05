@@ -93,6 +93,8 @@ pub struct PaneInfo {
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
     pub terminal_title_stripped: Option<String>,
+    /// The pane's label; plugin panes carry their manifest title.
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
