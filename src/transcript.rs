@@ -200,10 +200,10 @@ impl Transcript {
                 self.pr_calls.insert(id.to_string());
             }
             let dir = cwd.and_then(|c| resolve(c, &self.cwd)).unwrap_or_else(|| self.cwd.clone());
-            for mention in gh_pr_refs(command) {
+            for (mention, dir) in gh_pr_refs(command, &dir) {
                 match mention {
                     PrMention::Full(pr) => found.prs.push(pr),
-                    PrMention::Number(n) => found.pr_numbers.push((n, dir.clone())),
+                    PrMention::Number(n) => found.pr_numbers.push((n, dir)),
                 }
             }
         }
@@ -252,18 +252,27 @@ fn pr_scheme_refs(text: &str) -> Vec<PrMention> {
     found
 }
 
-/// `gh pr <verb> N` for verbs that act on an existing PR, with `-R/--repo owner/repo` if given.
+/// `gh pr <verb> N` for verbs that act on an existing PR, with `-R/--repo owner/repo` if given,
+/// each with the directory it runs in: `dir`, as changed by any `cd` earlier in the command.
 /// Each `;`/`|`/`&&` segment is its own command, and the PR is the verb's first positional
 /// argument: `gh pr diff 5 | head -n 20` names #5, never #20.
-fn gh_pr_refs(command: &str) -> Vec<PrMention> {
+fn gh_pr_refs(command: &str, dir: &Path) -> Vec<(PrMention, PathBuf)> {
     const VERBS: &[&str] =
         &["view", "diff", "checkout", "review", "comment", "merge", "edit", "ready", "close", "reopen", "checks"];
     /// Flags whose next token is their value, not a positional argument.
     const VALUED: &[&str] =
         &["-R", "--repo", "--json", "--jq", "-q", "-t", "--template", "-b", "--body", "-F", "--body-file"];
     let mut found = Vec::new();
+    let mut dir = dir.to_path_buf();
     for segment in command.split([';', '|', '&', '\n', '(', ')']) {
         let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if tokens.first() == Some(&"cd") {
+            // Same rules as for touched directories: no variables except $HOME, no `cd -`.
+            if let Some(target) = command_dirs(&tokens).first() {
+                dir = resolve(target, &dir).unwrap_or(dir);
+            }
+            continue;
+        }
         let Some(at) = tokens.windows(3).position(|w| w[0] == "gh" && w[1] == "pr" && VERBS.contains(&w[2])) else {
             continue;
         };
@@ -288,8 +297,8 @@ fn gh_pr_refs(command: &str) -> Vec<PrMention> {
         }
         let Some(number) = positional.and_then(|p| p.trim_start_matches('#').parse::<u32>().ok()) else { continue };
         found.push(match repo.and_then(|r| r.split_once('/')) {
-            Some((owner, repo)) => PrMention::Full(PrRef { owner: owner.into(), repo: repo.into(), number }),
-            None => PrMention::Number(number),
+            Some((owner, repo)) => (PrMention::Full(PrRef { owner: owner.into(), repo: repo.into(), number }), dir.clone()),
+            None => (PrMention::Number(number), dir.clone()),
         });
     }
     found
@@ -633,7 +642,7 @@ mod tests {
     #[test]
     fn gh_pr_verbs_and_pr_uris_name_pull_requests() {
         let pr = |owner: &str, repo: &str, number| PrMention::Full(PrRef { owner: owner.into(), repo: repo.into(), number });
-        let gh = gh_pr_refs;
+        let gh = |cmd: &str| gh_pr_refs(cmd, Path::new("/w/app")).into_iter().map(|(m, _)| m).collect::<Vec<_>>();
         assert!(gh("gh pr diff https://github.com/o/r/pull/3 | grep -n '^diff' | head -n 5").is_empty(), "URLs are found elsewhere");
         assert!(gh("gh pr view --help | head -n 6").is_empty());
         assert_eq!(gh("gh pr diff 5 --color=never | head -n 20"), [PrMention::Number(5)]);
@@ -641,6 +650,14 @@ mod tests {
         assert_eq!(gh("gh pr view --json title 12 -R Kamuno-CH/e2e_testing"), [pr("Kamuno-CH", "e2e_testing", 12)]);
         assert_eq!(gh("gh pr review #7 --approve --repo=o/r"), [pr("o", "r", 7)]);
         assert!(gh("gh pr list --limit 5; gh pr create --fill; gh pr view --web").is_empty());
+
+        // Each number belongs to the repo the command has `cd`'d into by then.
+        let dirs = |cmd: &str| gh_pr_refs(cmd, Path::new("/w/app")).into_iter().map(|(_, d)| d).collect::<Vec<_>>();
+        assert_eq!(
+            dirs("cd ../backend && gh pr checks 9 2>&1 | tail -8; cd /w/app && gh pr checks 82; cd \"$X\" && gh pr checks 1"),
+            [PathBuf::from("/w/backend"), "/w/app".into(), "/w/app".into()],
+            "an unresolvable cd keeps the previous directory"
+        );
         assert_eq!(
             pr_scheme_refs("pr://kamuno-ch/e2e_testing/36/diff/all and \"pr://41\""),
             [pr("kamuno-ch", "e2e_testing", 36), PrMention::Number(41)]
