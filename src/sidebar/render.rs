@@ -96,7 +96,9 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
     }
     // Repos the chat changed or has pull requests in (`refresh_git` skips deleted ones), then
     // PRs whose repo has no touched checkout. Whatever the user dismissed stays hidden.
-    let prs: Vec<&PrRecord> = visible_prs(&session.repos).collect();
+    // Newest first within each repo: GitHub numbers pull requests in creation order.
+    let mut prs: Vec<&PrRecord> = visible_prs(&session.repos).collect();
+    prs.sort_by_key(|p| (p.pr.slug(), std::cmp::Reverse(p.pr.number)));
     let has_prs = |root: &PathBuf| prs.iter().any(|p| p.root.as_ref() == Some(root));
     let shown: Vec<&PathBuf> = session
         .repos

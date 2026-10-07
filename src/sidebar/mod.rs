@@ -478,6 +478,39 @@ mod tests {
     }
 
     #[test]
+    fn pull_requests_list_newest_first_whatever_order_the_chat_named_them() {
+        let root = PathBuf::from("/r/kil");
+        let pr = |number| PrRecord { pr: PrRef { owner: "o".into(), repo: "kil".into(), number }, root: Some(root.clone()), status: None };
+        let mut model = Model::default();
+        model.statuses.insert(
+            root.clone(),
+            Ok(RepoStatus { branch: "main".into(), ahead: 0, behind: 0, changes: Vec::new(), unpushed: Vec::new(), fingerprint: 0 }),
+        );
+        model.session = Some(Session {
+            pane_id: "w:p1".into(),
+            title: String::new(),
+            repos: SessionRepos {
+                session: "s".into(),
+                repos: vec![RepoRecord { root: root.clone(), changed: true, baseline: None }],
+                prs: vec![pr(840), pr(843), pr(9), pr(841)],
+                ..SessionRepos::default()
+            },
+            persisted: false,
+            transcript: None,
+        });
+        let screen = render(&model, 40);
+        let urls: Vec<&str> = screen
+            .rows()
+            .into_iter()
+            .filter_map(|(_, click)| match click {
+                Click::Pr { url } => url.rsplit('/').next(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, ["843", "841", "840", "9"]);
+    }
+
+    #[test]
     fn right_click_targets_and_dismissals() {
         let (mine, reviewed) = (PathBuf::from("/r/mine"), PathBuf::from("/r/e2e"));
         let pr = |repo: &str, number| PrRef { owner: "o".into(), repo: repo.into(), number };
