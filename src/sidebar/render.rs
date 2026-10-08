@@ -88,6 +88,14 @@ impl View {
         }
     }
 
+    /// The URL a row stands for: a link, or a pull request.
+    pub(super) fn url_at(&self, row: usize) -> Option<&str> {
+        match self.clicks.get(&row) {
+            Some(Click::Pr { url }) => Some(url),
+            _ => self.links.get(&row).map(String::as_str),
+        }
+    }
+
     /// Draws the open menu over the rows it occupies.
     pub(super) fn overlay(&mut self, menu: &Menu, cols: usize, rows: usize) {
         for (row, _, label) in menu.placed(rows) {
@@ -428,19 +436,20 @@ fn fit_start(s: &str, max: usize) -> String {
     out
 }
 
-/// Draws the view; the link row under the pointer (`hover`) is underlined and bold.
+/// Draws the view; the link or pull request under the pointer (`hover`, see [`View::url_at`])
+/// is underlined and bold.
 pub(super) fn draw(view: &View, cols: usize, hover: Option<&str>) -> Result<()> {
     let mut out = std::io::stdout().lock();
     for (row, line) in view.lines.iter().enumerate() {
         let highlighted = view.highlight == Some(row);
-        let hovered = hover.is_some() && view.links.get(&row).map(String::as_str) == hover;
+        let hovered = hover.is_some() && view.url_at(row) == hover;
         queue!(out, cursor::MoveTo(0, row as u16))?;
         for (text, tone) in line {
             style(&mut out, *tone)?;
             if highlighted {
                 queue!(out, SetAttribute(Attribute::Reverse))?;
             }
-            if hovered && *tone == Tone::Url {
+            if hovered && matches!(tone, Tone::Url | Tone::Link) {
                 queue!(out, SetAttribute(Attribute::Underlined), SetAttribute(Attribute::Bold))?;
             }
             queue!(out, Print(text), SetAttribute(Attribute::Reset), ResetColor)?;

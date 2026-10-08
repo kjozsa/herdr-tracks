@@ -70,7 +70,8 @@ struct Model {
     scroll: usize,
     /// Right-click menu, while open.
     menu: Option<Menu>,
-    /// The link under the mouse pointer, drawn underlined so it reads as clickable.
+    /// The link or pull request under the mouse pointer, drawn underlined and bold so it reads
+    /// as clickable.
     hover: Option<String>,
     /// How many of the newest links the links block is scrolled past.
     links_scroll: usize,
@@ -309,7 +310,7 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
         }
         (menu, Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, row, .. })) => {
             model.menu = menu;
-            model.hover = view.links.get(&usize::from(row)).cloned();
+            model.hover = view.url_at(usize::from(row)).map(str::to_string);
             Ok(())
         }
         // Mouse releases and drags, focus changes: an open menu stays open.
@@ -726,6 +727,9 @@ mod tests {
         let view = window(&screen, 40, 5, &mut scroll, None);
         assert_eq!(view.lines.len(), 5);
         assert_eq!(view.clicks.keys().copied().collect::<Vec<_>>(), [3]);
+        // A pull request row hovers like a link: its URL is the hover target; a repo header isn't.
+        assert_eq!(view.url_at(3), Some(pr.url().as_str()));
+        assert_eq!(view.url_at(2), None);
 
         // Arrows walk all rows in order (the PR too), report the diff to show, and stop at ends.
         assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::Pr { url: pr.url(), path: None }));
