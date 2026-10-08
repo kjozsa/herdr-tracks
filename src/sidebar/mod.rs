@@ -131,12 +131,14 @@ impl Click {
     }
 }
 
-/// What a right-click menu acts on: a repo header, a pull request row, or a link.
+/// What a right-click menu acts on: a repo header, a pull request row, a link, or the links
+/// block's rule.
 #[derive(Debug, Clone, PartialEq)]
 enum Target {
     Repo(PathBuf),
     Pr(PrRef),
     Link(String),
+    Links,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,6 +146,7 @@ enum MenuItem {
     /// Open the pull request or link in the browser.
     Open,
     Dismiss,
+    DismissAllLinks,
 }
 
 /// An open right-click menu, anchored below (or above) the on-screen row it was opened on.
@@ -158,7 +161,12 @@ impl Menu {
         let items: &[(MenuItem, &str)] = match self.target {
             Target::Repo(_) => &[(MenuItem::Dismiss, "dismiss repo")],
             Target::Pr(_) => &[(MenuItem::Open, "open on GitHub"), (MenuItem::Dismiss, "dismiss PR")],
-            Target::Link(_) => &[(MenuItem::Open, "open in browser"), (MenuItem::Dismiss, "dismiss link")],
+            Target::Link(_) => &[
+                (MenuItem::Open, "open in browser"),
+                (MenuItem::Dismiss, "dismiss link"),
+                (MenuItem::DismissAllLinks, "dismiss all links"),
+            ],
+            Target::Links => &[(MenuItem::DismissAllLinks, "dismiss all links")],
         };
         let start = if self.row + 1 + items.len() <= rows { self.row + 1 } else { self.row.saturating_sub(items.len()) };
         items.iter().enumerate().map(|(i, (item, label))| (start + i, *item, *label)).collect()
@@ -351,6 +359,7 @@ fn handle_key(model: &mut Model, screen: &Screen, code: KeyCode) -> Result<()> {
             }
             _ => Ok(()),
         },
+        KeyCode::Char('C') => dismiss(model, &Target::Links),
         KeyCode::Char('o') => match &model.selected {
             Some(Key::Pr(url) | Key::PrFile(url, _)) => open_url(url),
             _ => Ok(()),
@@ -407,13 +416,14 @@ fn run_menu(model: &mut Model, target: &Target, item: MenuItem) -> Result<()> {
     match (item, target) {
         (MenuItem::Open, Target::Pr(pr)) => open_url(&pr.url()),
         (MenuItem::Open, Target::Link(url)) => open_url(url),
-        (MenuItem::Open, Target::Repo(_)) => Ok(()),
+        (MenuItem::Open, Target::Repo(_) | Target::Links) => Ok(()),
         (MenuItem::Dismiss, target) => dismiss(model, target),
+        (MenuItem::DismissAllLinks, _) => dismiss(model, &Target::Links),
     }
 }
 
 /// Hides a pull request from this chat's sidebar for good, a repo (with its pull requests)
-/// until the chat touches it again, or a link until the chat mentions it again.
+/// until the chat touches it again, or a link (or all of them) until the chat mentions it again.
 fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
     let Some(session) = model.session.as_mut() else { return Ok(()) };
     let at = session.transcript.as_ref().map_or(0, Transcript::position);
@@ -423,6 +433,18 @@ fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
         Target::Pr(pr) if !repos.dismissed_prs.iter().any(|d| d.same(pr)) => repos.dismissed_prs.push(pr.clone()),
         Target::Link(url) if !repos.dismissed_links.iter().any(|d| d.url == *url) => {
             repos.dismissed_links.push(DismissedLink { url: url.clone(), at })
+        }
+        Target::Links => {
+            let fresh: Vec<DismissedLink> = session
+                .links
+                .iter()
+                .filter(|url| !repos.dismissed_links.iter().any(|d| d.url == **url))
+                .map(|url| DismissedLink { url: url.clone(), at })
+                .collect();
+            if fresh.is_empty() {
+                return Ok(());
+            }
+            repos.dismissed_links.extend(fresh);
         }
         _ => return Ok(()),
     }
@@ -562,7 +584,10 @@ mod tests {
         assert_eq!(view.menus.get(&8), Some(&Target::Link("https://www.new.io/a".into())));
         let menu = Menu { target: Target::Link("https://www.new.io/a".into()), row: 8 };
         let items: Vec<_> = menu.placed(10).into_iter().map(|(_, item, label)| (item, label)).collect();
-        assert_eq!(items, [(MenuItem::Open, "open in browser"), (MenuItem::Dismiss, "dismiss link")]);
+        assert_eq!(
+            items,
+            [(MenuItem::Open, "open in browser"), (MenuItem::Dismiss, "dismiss link"), (MenuItem::DismissAllLinks, "dismiss all links")]
+        );
         run_menu(&mut model, &menu.target, MenuItem::Dismiss).unwrap();
         let urls: Vec<_> = render::links(&model, 30, 3, &mut 0).into_iter().filter_map(|(_, url)| url).collect();
         assert_eq!(urls, ["https://mid.io/b", "https://old.io/c"]);
@@ -592,6 +617,14 @@ mod tests {
         assert_eq!(block[1].1.as_deref(), Some("https://old.io/c"));
         handle_event(&mut model, &screen, &view, 10, wheel(MouseEventKind::ScrollUp, 9)).unwrap();
         assert_eq!(model.links_scroll, 0);
+
+        // `C`, or the rule's right-click menu, dismisses all links.
+        assert_eq!(view.menus.get(&7), Some(&Target::Links));
+        let rule_menu = Menu { target: Target::Links, row: 7 };
+        let items: Vec<_> = rule_menu.placed(10).into_iter().map(|(_, item, label)| (item, label)).collect();
+        assert_eq!(items, [(MenuItem::DismissAllLinks, "dismiss all links")]);
+        handle_event(&mut model, &screen, &view, 10, Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))).unwrap();
+        assert!(render::links(&model, 30, 3, &mut 0).is_empty());
     }
 
     #[test]

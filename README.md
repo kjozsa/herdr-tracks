@@ -69,7 +69,8 @@ In the sidebar:
 | Click | Select a row and show its diff; on a pull request, also expand or collapse it |
 | `o`, Ctrl+click | Open the selected pull request in the browser |
 | Click on a link | Open it in the browser |
-| Right-click | On a repo, pull request or link: dismiss it, or open the pull request / link in the browser |
+| Right-click | On a repo, pull request or link: dismiss it, or open the pull request / link in the browser; on a link or the links rule: dismiss all links |
+| `C` | Dismiss all links |
 | `Enter` | Move focus into the diff to scroll it |
 | `Esc` | Close the diff |
 

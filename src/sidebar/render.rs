@@ -80,9 +80,16 @@ impl View {
             self.links_top = Some(self.lines.len());
         }
         for (line, url) in block {
-            if let Some(url) = url {
-                self.menus.insert(self.lines.len(), Target::Link(url.clone()));
-                self.links.insert(self.lines.len(), url);
+            let row = self.lines.len();
+            match url {
+                Some(url) => {
+                    self.menus.insert(row, Target::Link(url.clone()));
+                    self.links.insert(row, url);
+                }
+                // The rule.
+                None => {
+                    self.menus.insert(row, Target::Links);
+                }
             }
             self.lines.push(line);
         }
