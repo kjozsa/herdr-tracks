@@ -4,7 +4,7 @@
 use super::collect::{is_dismissed, visible_prs};
 use super::{Click, Key, Menu, Model, Target};
 use crate::git::{LineStat, RepoStatus};
-use crate::github::{Checks, PrState};
+use crate::github::{self, Checks, PrState};
 use crate::state::PrRecord;
 use anyhow::Result;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
@@ -33,6 +33,8 @@ pub(super) enum Tone {
     Link,
     /// An entry of the right-click menu.
     Menu,
+    /// A web link in the links block.
+    Url,
 }
 
 pub(super) type Line = Vec<(String, Tone)>;
@@ -63,10 +65,29 @@ pub(super) struct View {
     pub(super) lines: Vec<Line>,
     pub(super) clicks: HashMap<usize, Click>,
     pub(super) menus: HashMap<usize, Target>,
+    /// The URL of each row of the pinned links block.
+    pub(super) links: HashMap<usize, String>,
+    /// The row of the links block's rule, when there is a block.
+    pub(super) links_top: Option<usize>,
     pub(super) highlight: Option<usize>,
 }
 
 impl View {
+    /// Pins `block` (see [`links`]) to the bottom of a `rows`-high pane, below the list.
+    pub(super) fn pin(&mut self, block: Vec<(Line, Option<String>)>, rows: usize) {
+        self.lines.resize(rows - block.len(), Vec::new());
+        if !block.is_empty() {
+            self.links_top = Some(self.lines.len());
+        }
+        for (line, url) in block {
+            if let Some(url) = url {
+                self.menus.insert(self.lines.len(), Target::Link(url.clone()));
+                self.links.insert(self.lines.len(), url);
+            }
+            self.lines.push(line);
+        }
+    }
+
     /// Draws the open menu over the rows it occupies.
     pub(super) fn overlay(&mut self, menu: &Menu, cols: usize, rows: usize) {
         for (row, _, label) in menu.placed(rows) {
@@ -250,6 +271,51 @@ fn hyperlink(url: &str, text: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
+/// The links block pinned to the bottom of the pane: a rule, then the chat's links, newest
+/// first, from `scroll` on as far as `max` rows allow, each with its URL. When not all fit, the
+/// rule counts them: `─ links 4–12 of 30`. `scroll` is clamped to the list. Pull requests
+/// already listed above are left out. Empty when there is nothing to show or no room.
+pub(super) fn links(model: &Model, cols: usize, max: usize, scroll: &mut usize) -> Vec<(Line, Option<String>)> {
+    let Some(session) = &model.session else { return Vec::new() };
+    let listed = |url: &str| github::pr_urls(url).iter().any(|pr| session.repos.prs.iter().any(|p| p.pr.same(pr)));
+    let dismissed = |url: &str| session.repos.dismissed_links.iter().any(|d| d.url == url);
+    let urls: Vec<&String> = session.links.iter().filter(|url| !listed(url) && !dismissed(url)).collect();
+    let room = max.saturating_sub(1);
+    if urls.is_empty() || room == 0 {
+        return Vec::new();
+    }
+    *scroll = (*scroll).min(urls.len().saturating_sub(room));
+    let shown = &urls[*scroll..urls.len().min(*scroll + room)];
+    let title = match (*scroll + 1, *scroll + shown.len()) {
+        _ if shown.len() == urls.len() => "─ links ".to_string(),
+        (first, last) if first == last => format!("─ links {first} of {} ", urls.len()),
+        (first, last) => format!("─ links {first}–{last} of {} ", urls.len()),
+    };
+    let rule = format!("{title}{}", "─".repeat(cols.saturating_sub(title.width())));
+    let mut block = vec![(vec![(fit_end(&rule, cols), Tone::Dim)], None)];
+    for url in shown {
+        let text = link_text(url, cols.saturating_sub(1));
+        block.push((vec![(" ".into(), Tone::Plain), (hyperlink(url, &text), Tone::Url)], Some((*url).clone())));
+    }
+    block
+}
+
+/// A URL as shown in `max` columns: without scheme and `www.`; when too long, the host and the
+/// end of the path, which tells similar links apart: `raw.githubusercontent.com…/src/dock.rs`.
+fn link_text(url: &str, max: usize) -> String {
+    let shown = url.trim_start_matches("https://").trim_start_matches("http://").trim_start_matches("www.");
+    let (host, path) = shown.split_once('/').unwrap_or((shown, ""));
+    if shown.width() <= max || host.width() + 10 > max {
+        return fit_end(shown, max);
+    }
+    let tail = fit_start(&format!("/{path}"), max - host.width());
+    // Start the tail at a path segment rather than mid-name, when there is one to start at.
+    match tail.find('/') {
+        Some(at) => format!("{host}…{}", &tail[at..]),
+        None => format!("{host}{tail}"),
+    }
+}
+
 /// `name branch ↑1 ↓2`: a long branch name is shortened, never the ahead/behind counts.
 pub(super) fn repo_header(root: &Path, status: Option<&Result<RepoStatus, String>>, cols: usize) -> Line {
     let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -291,6 +357,8 @@ pub(super) fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usi
             lines: screen.lines.clone(),
             clicks: screen.clicks.clone(),
             menus: screen.menus.clone(),
+            links: HashMap::new(),
+            links_top: None,
             highlight: selected,
         };
     }
@@ -313,6 +381,8 @@ pub(super) fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usi
         lines,
         clicks: screen.clicks.iter().filter_map(|(row, click)| Some((in_view(*row)?, click.clone()))).collect(),
         menus: screen.menus.iter().filter_map(|(row, target)| Some((in_view(*row)?, target.clone()))).collect(),
+        links: HashMap::new(),
+        links_top: None,
         highlight: selected.and_then(in_view),
     }
 }
@@ -358,15 +428,20 @@ fn fit_start(s: &str, max: usize) -> String {
     out
 }
 
-pub(super) fn draw(view: &View, cols: usize) -> Result<()> {
+/// Draws the view; the link row under the pointer (`hover`) is underlined and bold.
+pub(super) fn draw(view: &View, cols: usize, hover: Option<&str>) -> Result<()> {
     let mut out = std::io::stdout().lock();
     for (row, line) in view.lines.iter().enumerate() {
         let highlighted = view.highlight == Some(row);
+        let hovered = hover.is_some() && view.links.get(&row).map(String::as_str) == hover;
         queue!(out, cursor::MoveTo(0, row as u16))?;
         for (text, tone) in line {
             style(&mut out, *tone)?;
             if highlighted {
                 queue!(out, SetAttribute(Attribute::Reverse))?;
+            }
+            if hovered && *tone == Tone::Url {
+                queue!(out, SetAttribute(Attribute::Underlined), SetAttribute(Attribute::Bold))?;
             }
             queue!(out, Print(text), SetAttribute(Attribute::Reset), ResetColor)?;
         }
@@ -381,7 +456,11 @@ pub(super) fn draw(view: &View, cols: usize) -> Result<()> {
             queue!(out, terminal::Clear(terminal::ClearType::UntilNewLine))?;
         }
     }
-    queue!(out, cursor::MoveTo(0, view.lines.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    // Below a full pane there is nothing to clear: the cursor would stop on the last row and the
+    // erase would wipe it.
+    if view.lines.len() < usize::from(terminal::size()?.1) {
+        queue!(out, cursor::MoveTo(0, view.lines.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    }
     out.flush()?;
     Ok(())
 }
@@ -391,6 +470,7 @@ fn style(out: &mut impl Write, tone: Tone) -> Result<()> {
         Tone::Plain => {}
         Tone::Link => queue!(out, SetAttribute(Attribute::Underlined))?,
         Tone::Menu => queue!(out, SetAttribute(Attribute::Reverse), SetAttribute(Attribute::Bold))?,
+        Tone::Url => queue!(out, SetForegroundColor(Color::Blue))?,
         Tone::Dim => queue!(out, SetAttribute(Attribute::Dim))?,
         Tone::Repo => queue!(out, SetAttribute(Attribute::Bold))?,
         Tone::Branch => queue!(out, SetForegroundColor(Color::Cyan))?,
@@ -430,6 +510,15 @@ mod tests {
         assert_eq!(text(&row).width(), 24);
         assert_eq!(text(&file_row(" ", ("A ".into(), Tone::Staged), "logo.png", Some(LineStat::Binary), 20)), " A  logo.png     bin");
         assert_eq!(text(&file_row(" ", (" M".into(), Tone::Unstaged), "x.rs", None, 20)), "  M x.rs");
+    }
+
+    #[test]
+    fn long_links_keep_the_host_and_the_end_of_the_path() {
+        let url = "https://raw.githubusercontent.com/jwanga/herdr-plugin-github-status/main/src/dock.rs";
+        assert_eq!(link_text(url, 45), "raw.githubusercontent.com…/main/src/dock.rs");
+        assert_eq!(link_text("https://www.herdr.dev/docs/plugins/", 45), "herdr.dev/docs/plugins/");
+        // A host taking most of the width: plain cut at the end.
+        assert_eq!(link_text("https://a-very-long-subdomain.example.com/x/y", 20), "a-very-long-subdoma…");
     }
 
     #[test]

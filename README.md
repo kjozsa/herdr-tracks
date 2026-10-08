@@ -49,6 +49,12 @@ listed, unless one of its pull requests belongs to them. Pull requests are those
 created with `gh pr create`, or referred to: a pull request URL in your message, omp's `pr://`
 reads, or `gh pr view/diff/checkout/review/…`.
 
+The bottom of the sidebar collects the **links** of the chat, newest first: web links in your
+messages, in the agent's replies, and pages its tools read or fetched (not tool output). It
+takes at most half of the pane; when more links than that are collected, the mouse wheel
+scrolls them and the rule shows which are in view (`─ links 4–25 of 29`). Pull requests
+already listed above are left out.
+
 The repo list belongs to the chat and is kept across herdr restarts. The sidebar matches the
 width of herdr's left sidebar (`[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`).
 
@@ -62,15 +68,17 @@ In the sidebar:
 | `→` `←` (`l` `h`) | Expand / collapse a pull request into its files |
 | Click | Select a row and show its diff; on a pull request, also expand or collapse it |
 | `o`, Ctrl+click | Open the selected pull request in the browser |
-| Right-click | On a repo or pull request: dismiss it, or open the pull request on GitHub |
+| Click on a link | Open it in the browser |
+| Right-click | On a repo, pull request or link: dismiss it, or open the pull request / link in the browser |
 | `Enter` | Move focus into the diff to scroll it |
 | `Esc` | Close the diff |
 
 In the diff pane: `↓` `↑`, PgDn/PgUp, space/`b`, `g`/`G`, mouse wheel; `q` or `Esc` closes it.
 Diffs are formatted with [delta](https://github.com/dandavison/delta) when it is your git pager.
 
-A dismissed repo returns when the chat touches it again; a dismissed pull request stays hidden
-for that chat. The sidebar cannot be closed in a tab with an agent: it docks again right away.
+A dismissed repo returns when the chat touches it again, a dismissed link when the chat
+mentions it again; a dismissed pull request stays hidden for that chat. The sidebar cannot be
+closed in a tab with an agent: it docks again right away.
 The `show` action docks it in any tab:
 
 ```toml

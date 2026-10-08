@@ -19,6 +19,9 @@ pub(super) struct PrBatch {
     results: Vec<(PrRef, Result<PrStatus, String>)>,
 }
 
+/// How many of a chat's most recent links are kept.
+const LINKS_KEPT: usize = 50;
+
 /// Picks the followed agent pane and records repos under its processes' working dirs.
 /// Returns whether the repo list changed.
 pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
@@ -64,7 +67,7 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
                 .and_then(Format::of_agent)
                 .zip(target.agent_session.as_ref())
                 .map(|(format, s)| Transcript::new(format, s.value.clone(), fallback_cwd));
-            slot.insert(Session { pane_id: target.pane_id.clone(), title, repos, persisted, transcript })
+            slot.insert(Session { pane_id: target.pane_id.clone(), title, repos, persisted, transcript, links: Vec::new() })
         }
     };
 
@@ -79,8 +82,17 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
     }
     touches.extend(observed.into_iter().map(|path| Touch { path, writes: false, at: None }));
 
-    let SessionRepos { repos: records, prs, dismissed_repos, .. } = &mut session.repos;
+    let SessionRepos { repos: records, prs, dismissed_repos, dismissed_links, .. } = &mut session.repos;
     let mut dirty = false;
+    // Newest first; mentioning a dismissed link again, after the dismissal, brings it back.
+    for (url, at) in activity.links {
+        let before = dismissed_links.len();
+        dismissed_links.retain(|d| !(d.url == url && d.at < at));
+        dirty |= dismissed_links.len() != before;
+        session.links.retain(|l| *l != url);
+        session.links.insert(0, url);
+    }
+    session.links.truncate(LINKS_KEPT);
     for touch in touches {
         let Some(root) = repos::repo_root(&touch.path) else { continue };
         // A tool call after the dismissal brings a dismissed repo back; the agent merely

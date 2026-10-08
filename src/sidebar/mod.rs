@@ -12,7 +12,7 @@ use crate::diff::{self, DiffRequest};
 use crate::git::{Change, RepoStatus};
 use crate::github::{self, PrFile, PrRef};
 use crate::herdr;
-use crate::state::{self, DismissedRepo, SessionRepos};
+use crate::state::{self, DismissedLink, DismissedRepo, SessionRepos};
 use crate::transcript::Transcript;
 use anyhow::{anyhow, Context, Result};
 use collect::{is_dismissed, PrBatch};
@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const GIT_EVERY: Duration = Duration::from_secs(5);
 const PR_EVERY: Duration = Duration::from_secs(30);
+/// Links scrolled per mouse-wheel notch.
+const WHEEL_LINKS: usize = 3;
 
 /// Which chat session the sidebar follows, and whether its repo set is persisted.
 struct Session {
@@ -37,6 +39,8 @@ struct Session {
     persisted: bool,
     /// Transcript being tailed (omp, Claude Code); other agents rely on process working dirs only.
     transcript: Option<Transcript>,
+    /// Web links the chat mentioned, newest first; rebuilt from the transcript on start.
+    links: Vec<String>,
 }
 
 #[derive(Default)]
@@ -66,6 +70,10 @@ struct Model {
     scroll: usize,
     /// Right-click menu, while open.
     menu: Option<Menu>,
+    /// The link under the mouse pointer, drawn underlined so it reads as clickable.
+    hover: Option<String>,
+    /// How many of the newest links the links block is scrolled past.
+    links_scroll: usize,
 }
 
 impl Model {
@@ -122,16 +130,18 @@ impl Click {
     }
 }
 
-/// What a right-click menu acts on: a repo header, or a pull request row.
+/// What a right-click menu acts on: a repo header, a pull request row, or a link.
 #[derive(Debug, Clone, PartialEq)]
 enum Target {
     Repo(PathBuf),
     Pr(PrRef),
+    Link(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MenuItem {
-    OpenPr,
+    /// Open the pull request or link in the browser.
+    Open,
     Dismiss,
 }
 
@@ -146,7 +156,8 @@ impl Menu {
     fn placed(&self, rows: usize) -> Vec<(usize, MenuItem, &'static str)> {
         let items: &[(MenuItem, &str)] = match self.target {
             Target::Repo(_) => &[(MenuItem::Dismiss, "dismiss repo")],
-            Target::Pr(_) => &[(MenuItem::OpenPr, "open on GitHub"), (MenuItem::Dismiss, "dismiss PR")],
+            Target::Pr(_) => &[(MenuItem::Open, "open on GitHub"), (MenuItem::Dismiss, "dismiss PR")],
+            Target::Link(_) => &[(MenuItem::Open, "open in browser"), (MenuItem::Dismiss, "dismiss link")],
         };
         let start = if self.row + 1 + items.len() <= rows { self.row + 1 } else { self.row.saturating_sub(items.len()) };
         items.iter().enumerate().map(|(i, (item, label))| (start + i, *item, *label)).collect()
@@ -171,7 +182,7 @@ struct Due {
 /// Runs for the pane's lifetime. There is no quit key: the sidebar is mandatory.
 fn event_loop(me: &str) -> Result<()> {
     let mut model = Model { me: me.to_string(), ..Model::default() };
-    let mut shown: (Vec<Line>, Option<usize>) = (Vec::new(), None);
+    let mut shown: (Vec<Line>, Option<usize>, Option<String>) = (Vec::new(), None, None);
     let now = Instant::now();
     let mut due = Due { sample: now, git: now, pr: now };
     loop {
@@ -180,18 +191,23 @@ fn event_loop(me: &str) -> Result<()> {
         let (cols, rows) = (usize::from(cols), usize::from(rows));
         let screen = render::render(&model, cols);
         let selected_row = screen.row_of(model.selected.as_ref());
-        let mut view = render::window(&screen, cols, rows, &mut model.scroll, selected_row);
+        // The links block takes at most half the pane; the list scrolls above it.
+        let mut links_scroll = model.links_scroll;
+        let block = render::links(&model, cols, rows / 2, &mut links_scroll);
+        model.links_scroll = links_scroll;
+        let mut view = render::window(&screen, cols, rows - block.len(), &mut model.scroll, selected_row);
+        view.pin(block, rows);
         if let Some(menu) = &model.menu {
             view.overlay(menu, cols, rows);
         }
-        if (&view.lines, view.highlight) != (&shown.0, shown.1) {
-            render::draw(&view, cols)?;
-            shown = (view.lines.clone(), view.highlight);
+        if (&view.lines, view.highlight, &model.hover) != (&shown.0, shown.1, &shown.2) {
+            render::draw(&view, cols, model.hover.as_deref())?;
+            shown = (view.lines.clone(), view.highlight, model.hover.clone());
         }
         if event::poll(due.sample.min(due.git).saturating_duration_since(Instant::now()))? {
             let event = event::read()?;
             if matches!(event, Event::Resize(..)) {
-                shown = (Vec::new(), None);
+                shown = (Vec::new(), None, None);
             }
             let result = handle_event(&mut model, &screen, &view, rows, event);
             model.note(result);
@@ -268,6 +284,9 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
         }
         (None, Event::Key(KeyEvent { code, .. })) => handle_key(model, screen, code),
         (None, Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, modifiers, .. })) => {
+            if let Some(url) = view.links.get(&usize::from(row)) {
+                return open_url(url);
+            }
             match view.clicks.get(&usize::from(row)) {
                 Some(click) => handle_click(model, click, modifiers.contains(KeyModifiers::CONTROL)),
                 None => Ok(()),
@@ -277,7 +296,23 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
             model.menu = menu;
             crate::dock::hold_width(&model.me)
         }
-        // Mouse moves and releases, focus changes: an open menu stays open.
+        // The wheel over the links block scrolls it (and closes a menu anchored to its rows).
+        (_, Event::Mouse(MouseEvent { kind: kind @ (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp), row, .. }))
+            if view.links_top.is_some_and(|top| usize::from(row) >= top) =>
+        {
+            model.links_scroll = match kind {
+                MouseEventKind::ScrollDown => model.links_scroll + WHEEL_LINKS,
+                _ => model.links_scroll.saturating_sub(WHEEL_LINKS),
+            };
+            model.hover = None;
+            Ok(())
+        }
+        (menu, Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, row, .. })) => {
+            model.menu = menu;
+            model.hover = view.links.get(&usize::from(row)).cloned();
+            Ok(())
+        }
+        // Mouse releases and drags, focus changes: an open menu stays open.
         (menu, _) => {
             model.menu = menu;
             Ok(())
@@ -369,14 +404,15 @@ fn expand(model: &mut Model, url: String) {
 
 fn run_menu(model: &mut Model, target: &Target, item: MenuItem) -> Result<()> {
     match (item, target) {
-        (MenuItem::OpenPr, Target::Pr(pr)) => open_url(&pr.url()),
+        (MenuItem::Open, Target::Pr(pr)) => open_url(&pr.url()),
+        (MenuItem::Open, Target::Link(url)) => open_url(url),
+        (MenuItem::Open, Target::Repo(_)) => Ok(()),
         (MenuItem::Dismiss, target) => dismiss(model, target),
-        (MenuItem::OpenPr, Target::Repo(_)) => Ok(()),
     }
 }
 
-/// Hides a pull request from this chat's sidebar for good, or a repo (with its pull requests)
-/// until the chat touches it again.
+/// Hides a pull request from this chat's sidebar for good, a repo (with its pull requests)
+/// until the chat touches it again, or a link until the chat mentions it again.
 fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
     let Some(session) = model.session.as_mut() else { return Ok(()) };
     let at = session.transcript.as_ref().map_or(0, Transcript::position);
@@ -384,6 +420,9 @@ fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
     match target {
         Target::Repo(root) if !is_dismissed(repos, root) => repos.dismissed_repos.push(DismissedRepo { root: root.clone(), at }),
         Target::Pr(pr) if !repos.dismissed_prs.iter().any(|d| d.same(pr)) => repos.dismissed_prs.push(pr.clone()),
+        Target::Link(url) if !repos.dismissed_links.iter().any(|d| d.url == *url) => {
+            repos.dismissed_links.push(DismissedLink { url: url.clone(), at })
+        }
         _ => return Ok(()),
     }
     if session.persisted {
@@ -392,14 +431,17 @@ fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
     Ok(())
 }
 
+/// Opens the URL in the desktop's browser without waiting for it.
 fn open_url(url: &str) -> Result<()> {
-    Command::new("xdg-open")
+    let mut opener = Command::new("xdg-open")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("xdg-open")?;
+    // Collect it when it exits, or every click would leave a zombie process behind.
+    std::thread::spawn(move || opener.wait());
     Ok(())
 }
 
@@ -469,12 +511,86 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            links: Vec::new(),
         });
         let screen = render(&model, 40);
         let rows: Vec<Key> = screen.rows().into_iter().map(|(_, c)| c.key()).collect();
         assert_eq!(rows, [Key::File(root.clone(), "a.py".into()), Key::Unpushed(root.clone(), "e2e/b.py".into())]);
         let unpushed = screen.rows()[1].1.diff_request();
         assert_eq!(unpushed, DiffRequest::Unpushed { root, path: "e2e/b.py".into() });
+    }
+
+    #[test]
+    fn links_are_pinned_to_the_bottom_newest_first_without_listed_prs() {
+        let pr = PrRef { owner: "o".into(), repo: "r".into(), number: 7 };
+        let session = Session {
+            pane_id: "w:p1".into(),
+            title: "chat".into(),
+            repos: SessionRepos {
+                session: "s".into(),
+                prs: vec![PrRecord { pr: pr.clone(), root: None, status: None }],
+                ..SessionRepos::default()
+            },
+            persisted: false,
+            transcript: None,
+            links: vec![
+                "https://www.new.io/a".into(),
+                format!("{}/files", pr.url()),
+                "https://mid.io/b".into(),
+                "https://old.io/c".into(),
+            ],
+        };
+        let mut model = Model { session: Some(session), ..Model::default() };
+        // Room for the rule and two links: the newest two that are not PR rows already.
+        let block = render::links(&model, 30, 3, &mut 0);
+        let urls: Vec<_> = block.iter().filter_map(|(_, url)| url.as_deref()).collect();
+        assert_eq!(urls, ["https://www.new.io/a", "https://mid.io/b"]);
+
+        // Pinned to the last rows of a 10-row pane; a click there resolves to the link.
+        let screen = render(&model, 30);
+        let mut view = window(&screen, 30, 10 - block.len(), &mut 0, None);
+        view.pin(block, 10);
+        assert_eq!(view.lines.len(), 10);
+        assert_eq!(view.links.get(&8).map(String::as_str), Some("https://www.new.io/a"));
+        assert_eq!(view.links.get(&9).map(String::as_str), Some("https://mid.io/b"));
+        let shown: String = view.lines[8].iter().map(|(t, _)| crate::ansi::fit(t, 99)).collect();
+        assert_eq!(crate::ansi::width(&shown), " new.io/a".len(), "scheme and www. are not shown");
+        assert!(render::links(&model, 30, 1, &mut 0).is_empty(), "no room for a link: no block");
+
+        // A link row right-clicks to its own menu; dismissing it lets the next one move up.
+        assert_eq!(view.menus.get(&8), Some(&Target::Link("https://www.new.io/a".into())));
+        let menu = Menu { target: Target::Link("https://www.new.io/a".into()), row: 8 };
+        let items: Vec<_> = menu.placed(10).into_iter().map(|(_, item, label)| (item, label)).collect();
+        assert_eq!(items, [(MenuItem::Open, "open in browser"), (MenuItem::Dismiss, "dismiss link")]);
+        run_menu(&mut model, &menu.target, MenuItem::Dismiss).unwrap();
+        let urls: Vec<_> = render::links(&model, 30, 3, &mut 0).into_iter().filter_map(|(_, url)| url).collect();
+        assert_eq!(urls, ["https://mid.io/b", "https://old.io/c"]);
+
+        // Moving the pointer onto a link row hovers that link; anywhere else clears it, and an
+        // open menu stays open meanwhile.
+        let moved = |row| Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, column: 3, row, modifiers: KeyModifiers::NONE });
+        handle_event(&mut model, &screen, &view, 10, moved(9)).unwrap();
+        assert_eq!(model.hover.as_deref(), Some("https://mid.io/b"));
+        model.menu = Some(Menu { target: Target::Link("https://mid.io/b".into()), row: 9 });
+        handle_event(&mut model, &screen, &view, 10, moved(0)).unwrap();
+        assert_eq!(model.hover, None);
+        assert!(model.menu.is_some());
+
+        // The wheel scrolls the links block, not the list above it; drawing clamps the offset
+        // and the rule counts what is shown.
+        let wheel = |kind, row| Event::Mouse(MouseEvent { kind, column: 3, row, modifiers: KeyModifiers::NONE });
+        handle_event(&mut model, &screen, &view, 10, wheel(MouseEventKind::ScrollDown, 2)).unwrap();
+        assert_eq!(model.links_scroll, 0, "row 2 is above the links block");
+        handle_event(&mut model, &screen, &view, 10, wheel(MouseEventKind::ScrollDown, 9)).unwrap();
+        assert_eq!(model.links_scroll, WHEEL_LINKS);
+        let mut scroll = model.links_scroll;
+        let block = render::links(&model, 30, 2, &mut scroll);
+        assert_eq!(scroll, 1, "two links, room for one: at most one to scroll past");
+        let rule: String = block[0].0.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(rule.starts_with("─ links 2 of 2 ─"), "{rule}");
+        assert_eq!(block[1].1.as_deref(), Some("https://old.io/c"));
+        handle_event(&mut model, &screen, &view, 10, wheel(MouseEventKind::ScrollUp, 9)).unwrap();
+        assert_eq!(model.links_scroll, 0);
     }
 
     #[test]
@@ -497,6 +613,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            links: Vec::new(),
         });
         let screen = render(&model, 40);
         let urls: Vec<&str> = screen
@@ -542,6 +659,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            links: Vec::new(),
         });
         // Rows: 0 mine, 1 blank, 2 e2e, 3 #36, 4 blank, 5 o/infra, 6 #133.
         let screen = render(&model, 40);
@@ -553,7 +671,7 @@ mod tests {
 
         // The menu opens below the clicked row, or above it at the bottom of the pane.
         let below = Menu { target: Target::Pr(pr("infra", 133)), row: 3 };
-        assert_eq!(below.placed(10).iter().map(|(r, i, _)| (*r, *i)).collect::<Vec<_>>(), [(4, MenuItem::OpenPr), (5, MenuItem::Dismiss)]);
+        assert_eq!(below.placed(10).iter().map(|(r, i, _)| (*r, *i)).collect::<Vec<_>>(), [(4, MenuItem::Open), (5, MenuItem::Dismiss)]);
         let above = Menu { target: Target::Pr(pr("infra", 133)), row: 9 };
         assert_eq!(above.placed(10).iter().map(|(r, ..)| *r).collect::<Vec<_>>(), [7, 8]);
 
@@ -594,6 +712,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            links: Vec::new(),
         });
         // Rows: 0 title, 1 blank, 2 repo header, 3 PR, 4 a.rs, 5 b.rs.
         let screen = render(&model, 40);

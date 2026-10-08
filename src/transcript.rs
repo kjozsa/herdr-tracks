@@ -55,6 +55,10 @@ pub struct Activity {
     /// Pull requests referred to by number only (`pr://N`, `gh pr checkout N`), with the
     /// directory whose repository they belong to.
     pub pr_numbers: Vec<(u32, PathBuf)>,
+    /// Web links in the user's messages, the agent's replies and its tool-call targets, in
+    /// transcript order, each with the position of its mention. Tool output is left out: it
+    /// would bury the rest.
+    pub links: Vec<(String, u64)>,
 }
 
 impl Transcript {
@@ -114,8 +118,12 @@ impl Transcript {
 
     fn scan_omp(&mut self, line: &[u8], found: &mut Activity) {
         let is_session = contains(line, b"\"type\":\"session\"");
-        let is_user_link = contains(line, b"\"role\":\"user\"") && contains(line, b"github.com/");
-        if !is_session && !is_user_link && !self.may_hold_pr_result(line, b"\"toolResult\"") && !contains(line, b"\"toolCall\"")
+        let is_message_link = contains(line, b"http")
+            && (contains(line, b"\"role\":\"user\"") || contains(line, b"\"role\":\"assistant\""));
+        if !is_session
+            && !is_message_link
+            && !self.may_hold_pr_result(line, b"\"toolResult\"")
+            && !contains(line, b"\"toolCall\"")
         {
             return;
         }
@@ -132,19 +140,30 @@ impl Transcript {
                 let text: String = message["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect();
                 self.record_result(message["toolCallId"].as_str().unwrap_or_default(), &text, found);
             }
-            Some("user") => found.prs.extend(github::pr_urls(&message_text(&message["content"]))),
+            Some("user") => {
+                let text = message_text(&message["content"]);
+                found.prs.extend(github::pr_urls(&text));
+                self.record_links(&text, found);
+            }
             _ => {
-                for block in message["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "toolCall") {
-                    let args = &block["arguments"];
-                    self.record_call(block["id"].as_str(), &omp_call(&block["name"], args), args, found);
+                for block in message["content"].as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("text") => self.record_links(block["text"].as_str().unwrap_or_default(), found),
+                        Some("toolCall") => {
+                            let args = &block["arguments"];
+                            self.record_call(block["id"].as_str(), &omp_call(&block["name"], args), args, found);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
     }
 
     fn scan_claude(&mut self, line: &[u8], found: &mut Activity) {
-        let is_user_link = contains(line, b"\"type\":\"user\"") && contains(line, b"github.com/");
-        if !is_user_link && !contains(line, b"\"tool_use\"") && !self.may_hold_pr_result(line, b"\"tool_result\"") {
+        let is_message_link = contains(line, b"http")
+            && (contains(line, b"\"type\":\"user\"") || contains(line, b"\"type\":\"assistant\""));
+        if !is_message_link && !contains(line, b"\"tool_use\"") && !self.may_hold_pr_result(line, b"\"tool_result\"") {
             return;
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
@@ -154,10 +173,15 @@ impl Transcript {
         let content = &entry["message"]["content"];
         if entry["type"] == "user" {
             // The user's own words: a plain string or text blocks (not tool results).
-            found.prs.extend(github::pr_urls(&message_text(content)));
+            let text = message_text(content);
+            found.prs.extend(github::pr_urls(&text));
+            self.record_links(&text, found);
         }
         for block in content.as_array().into_iter().flatten() {
             match block["type"].as_str() {
+                Some("text") if entry["type"] == "assistant" => {
+                    self.record_links(block["text"].as_str().unwrap_or_default(), found);
+                }
                 Some("tool_use") => {
                     let input = &block["input"];
                     self.record_call(block["id"].as_str(), &claude_call(&block["name"], input), input, found);
@@ -188,6 +212,7 @@ impl Transcript {
             .collect::<Vec<_>>()
             .join("\n");
         found.prs.extend(github::pr_urls(&raw));
+        self.record_links(&raw, found);
         for mention in pr_scheme_refs(&raw) {
             match mention {
                 PrMention::Full(pr) => found.prs.push(pr),
@@ -211,11 +236,57 @@ impl Transcript {
         found.touches.extend(call_touches(call, &self.cwd).into_iter().map(|t| Touch { at, ..t }));
     }
 
+    fn record_links(&self, text: &str, found: &mut Activity) {
+        found.links.extend(urls(text).into_iter().map(|url| (url, self.line_end)));
+    }
+
     fn record_result(&mut self, id: &str, text: &str, found: &mut Activity) {
         if self.pr_calls.remove(id) {
             found.prs.extend(github::pr_urls(text));
         }
     }
+}
+
+/// `http(s)://` links in free text: Markdown brackets, quotes and trailing punctuation are not
+/// part of them, and templated or variable URLs (`{owner}`, `$HOST`) are skipped.
+fn urls(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("http") {
+        let tail = &rest[at..];
+        if !(tail.starts_with("https://") || tail.starts_with("http://")) {
+            rest = &tail[4..];
+            continue;
+        }
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '|' | '\\' | ']' | '}'))
+            .unwrap_or(tail.len());
+        let mut url = &tail[..end];
+        // Trailing punctuation is prose, and a closing parenthesis ends the URL unless the URL
+        // opened one: `[docs](https://x/y), …` keeps neither the `)` nor the `,`.
+        loop {
+            let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
+            let trimmed = match trimmed.strip_suffix(')') {
+                Some(inner) if trimmed.matches('(').count() < trimmed.matches(')').count() => inner,
+                _ => trimmed,
+            };
+            if trimmed.len() == url.len() {
+                break;
+            }
+            url = trimmed;
+        }
+        let after_scheme = url.split("://").nth(1).unwrap_or_default();
+        let (host, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+        let local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+        // Bare site roots (`https://github.com/`) are noise, a local dev server is not; `…` marks
+        // a URL abbreviated in prose, not a real one.
+        let real = (host.contains('.') || local) && !url.contains(['{', '$', '…']);
+        if real && (local || !path.is_empty()) {
+            found.push(url.to_string());
+        }
+        rest = &tail[end..];
+    }
+    found
 }
 
 /// Text of a message's content: a plain string or the `text` of its blocks.
@@ -691,6 +762,45 @@ mod tests {
         let numbers: Vec<_> = activity.prs.iter().map(|p| (p.repo.as_str(), p.number)).collect();
         assert_eq!(numbers, [("r", 36), ("other", 5)], "file contents and tool output do not count");
         assert_eq!(activity.pr_numbers, [(9, PathBuf::from("/work/lib"))], "numbers carry the command's directory");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn urls_stop_at_markdown_quotes_and_trailing_punctuation() {
+        assert_eq!(
+            urls("see [docs](https://herdr.dev/docs/plugins/), then **https://x.io/a?b=1**. Also \"http://localhost:8080/\"."),
+            ["https://herdr.dev/docs/plugins/", "https://x.io/a?b=1", "http://localhost:8080/"]
+        );
+        assert_eq!(urls("https://en.wikipedia.org/wiki/Rust_(language) is"), ["https://en.wikipedia.org/wiki/Rust_(language)"]);
+        assert!(urls("https://github.com/{owner}/x https://$HOST/a https:// httpx://a.b").is_empty());
+        assert!(urls("https://github.com/ https://accounts.google.com https://github.com/…/pull/133").is_empty());
+        assert_eq!(urls("http://localhost:5174 and https://127.0.0.1:8080"), ["http://localhost:5174", "https://127.0.0.1:8080"]);
+    }
+
+    #[test]
+    fn links_come_from_messages_and_call_targets_not_tool_output() {
+        let line = |role: &str, content: &str| format!(r#"{{"type":"message","message":{{"role":"{role}","content":{content}}}}}"#);
+        let (mut t, file) = transcript(
+            "links",
+            Format::Omp,
+            &format!(
+                "{}\n",
+                [
+                    line("user", r#"[{"type":"text","text":"check https://a.io/one"}]"#),
+                    line(
+                        "assistant",
+                        r#"[{"type":"thinking","thinking":"https://a.io/thought"},{"type":"text","text":"done, see https://a.io/two"},{"type":"toolCall","id":"x","name":"read","arguments":{"path":"https://a.io/three"}}]"#
+                    ),
+                    line("toolResult", r#"[{"type":"text","text":"https://a.io/output"}]"#),
+                ]
+                .join("\n")
+            ),
+        );
+        let links = t.poll().unwrap().links;
+        let urls: Vec<&str> = links.iter().map(|(url, _)| url.as_str()).collect();
+        assert_eq!(urls, ["https://a.io/one", "https://a.io/two", "https://a.io/three"]);
+        // Positions say which line mentioned a link: the user's line comes before the agent's.
+        assert!(links[0].1 < links[1].1 && links[1].1 == links[2].1, "{links:?}");
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }

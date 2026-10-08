@@ -68,6 +68,9 @@ pub struct SessionRepos {
     /// Pull requests the user dismissed from this chat's sidebar.
     #[serde(default)]
     pub dismissed_prs: Vec<PrRef>,
+    /// Links the user dismissed from this chat's sidebar.
+    #[serde(default)]
+    pub dismissed_links: Vec<DismissedLink>,
 }
 
 /// A repo hidden from the sidebar until the chat touches it again.
@@ -75,6 +78,14 @@ pub struct SessionRepos {
 pub struct DismissedRepo {
     pub root: PathBuf,
     /// Transcript position at dismissal; only tool calls after it bring the repo back.
+    pub at: u64,
+}
+
+/// A link hidden from the sidebar until the chat mentions it again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DismissedLink {
+    pub url: String,
+    /// Transcript position at dismissal; only mentions after it bring the link back.
     pub at: u64,
 }
 
