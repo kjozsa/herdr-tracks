@@ -78,7 +78,8 @@ Diffs are formatted with [delta](https://github.com/dandavison/delta) when it is
 
 A dismissed repo returns when the chat touches it again, a dismissed link when the chat
 mentions it again; a dismissed pull request stays hidden for that chat. The sidebar cannot be
-closed in a tab with an agent: it docks again right away.
+closed in a tab with an agent: it docks again right away. Once every other pane of its tab is
+closed, it closes too, and so does the tab.
 The `show` action docks it in any tab:
 
 ```toml

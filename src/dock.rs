@@ -3,7 +3,7 @@
 use crate::herdr::{self, Layout, PaneInfo};
 use crate::state::DockGuard;
 use anyhow::{anyhow, bail, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 /// herdr's defaults for `[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`.
@@ -30,7 +30,8 @@ fn context_tab() -> Result<String> {
 }
 
 /// Event hooks: keep a sidebar in the context tab whenever it hosts an agent. A closed sidebar
-/// docks again straight away (`pane.closed`): it is not meant to be dismissed.
+/// docks again straight away (`pane.closed`): it is not meant to be dismissed. Once the last
+/// other pane of a tab closes, its Tracks panes close too.
 pub fn ensure() -> Result<()> {
     place(false)
 }
@@ -42,7 +43,27 @@ pub fn show() -> Result<()> {
 
 fn place(without_agent: bool) -> Result<()> {
     let mut guard = DockGuard::acquire()?;
-    let tab = match closed_pane() {
+    let closed = closed_pane();
+    let panes = herdr::pane_list()?;
+    // Forget sidebars of tabs that have since been closed.
+    let live_tabs: HashSet<&str> = panes.iter().map(|p| p.tab_id.as_str()).collect();
+    let known = guard.state.tabs.len();
+    guard.state.tabs.retain(|tab, _| live_tabs.contains(tab.as_str()));
+    let mut changed = guard.state.tabs.len() != known;
+    // Left on their own, Tracks panes would keep the tab, and its workspace, open under the
+    // plugin's name: once anything closes, close them too. Their tabs are forgotten first, so
+    // that closing a sidebar does not dock it again.
+    let orphans = if closed.is_some() { orphans(&panes) } else { Vec::new() };
+    for pane in &orphans {
+        changed |= guard.state.tabs.remove(&pane.tab_id).is_some();
+    }
+    if changed {
+        guard.save()?;
+    }
+    for pane in orphans {
+        herdr::pane_close(&pane.pane_id)?;
+    }
+    let tab = match closed {
         // Only a closed sidebar matters; other panes close all the time.
         Some(closed) => match guard.state.tabs.iter().find(|(_, pane)| **pane == closed) {
             Some((tab, _)) => tab.clone(),
@@ -50,14 +71,6 @@ fn place(without_agent: bool) -> Result<()> {
         },
         None => context_tab()?,
     };
-    let panes = herdr::pane_list()?;
-    // Forget sidebars of tabs that have since been closed.
-    let live_tabs: HashSet<&str> = panes.iter().map(|p| p.tab_id.as_str()).collect();
-    let known = guard.state.tabs.len();
-    guard.state.tabs.retain(|tab, _| live_tabs.contains(tab.as_str()));
-    if guard.state.tabs.len() != known {
-        guard.save()?;
-    }
     let mut tab_panes: Vec<&PaneInfo> = panes.iter().filter(|p| p.tab_id == tab).collect();
     if let Some(id) = guard.state.tabs.get(&tab).filter(|id| tab_panes.iter().any(|p| &p.pane_id == *id)).cloned() {
         if runs(&id, Mode::Sidebar)? {
@@ -90,6 +103,19 @@ fn closed_pane() -> Option<String> {
     let event: serde_json::Value = serde_json::from_str(&std::env::var("HERDR_PLUGIN_EVENT_JSON").ok()?).ok()?;
     let data = &event["data"];
     (data["type"] == "pane_closed").then(|| data["pane_id"].as_str().map(str::to_string)).flatten()
+}
+
+/// The Tracks panes of tabs that hold nothing else: the agent and every other pane closed.
+fn orphans(panes: &[PaneInfo]) -> Vec<&PaneInfo> {
+    let mut tabs: BTreeMap<&str, Vec<&PaneInfo>> = BTreeMap::new();
+    for pane in panes {
+        tabs.entry(pane.tab_id.as_str()).or_default().push(pane);
+    }
+    tabs.into_values().filter(|tab| tab.iter().all(|p| is_tracks(p))).flatten().collect()
+}
+
+fn is_tracks(pane: &PaneInfo) -> bool {
+    matches!(pane.label.as_deref(), Some(SIDEBAR_TITLE | DIFF_TITLE))
 }
 
 /// Startup hook. herdr restores panes after a restart, but plugin panes come back as plain
@@ -307,5 +333,33 @@ mod tests {
         assert_eq!(resolve_width(None, Some(&ui("sidebar_min_width = 50"))), 50, "minimum lifts the default width");
         assert_eq!(resolve_width(None, Some(&ui("sidebar_width = 60"))), DEFAULT_MAX_WIDTH, "default maximum caps it");
         assert_eq!(resolve_width(Some(10), None), DEFAULT_MIN_WIDTH);
+    }
+
+    #[test]
+    fn tabs_left_with_only_tracks_panes_are_orphaned() {
+        let pane = |id: &str, tab: &str, label: Option<&str>, agent: Option<&str>| PaneInfo {
+            pane_id: id.into(),
+            tab_id: tab.into(),
+            terminal_id: String::new(),
+            agent: agent.map(str::to_string),
+            agent_session: None,
+            cwd: None,
+            foreground_cwd: None,
+            terminal_title_stripped: None,
+            label: label.map(str::to_string),
+        };
+        let panes = [
+            // The agent closed: sidebar and diff are all that is left.
+            pane("a1", "a", Some(SIDEBAR_TITLE), None),
+            pane("a2", "a", Some(DIFF_TITLE), None),
+            // The agent runs.
+            pane("b1", "b", None, Some("omp")),
+            pane("b2", "b", Some(SIDEBAR_TITLE), None),
+            // The agent exited, its shell stays.
+            pane("c1", "c", None, None),
+            pane("c2", "c", Some(SIDEBAR_TITLE), None),
+        ];
+        let ids: Vec<&str> = orphans(&panes).iter().map(|p| p.pane_id.as_str()).collect();
+        assert_eq!(ids, ["a1", "a2"]);
     }
 }
