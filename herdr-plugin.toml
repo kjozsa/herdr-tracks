@@ -30,13 +30,18 @@ contexts = ["workspace", "pane"]
 command = ["target/release/herdr-tracks", "show"]
 
 # The sidebar is mandatory in tabs that host an agent: these idempotent hooks dock it, and
-# `pane.closed` brings it straight back when it is closed.
+# `pane.closed` brings it straight back when it is closed. A pane whose shell exits sends
+# `pane.exited` instead; either one closes Tracks panes left alone in their tab.
 [[events]]
 on = "pane.agent_detected"
 command = ["target/release/herdr-tracks", "ensure"]
 
 [[events]]
 on = "pane.closed"
+command = ["target/release/herdr-tracks", "ensure"]
+
+[[events]]
+on = "pane.exited"
 command = ["target/release/herdr-tracks", "ensure"]
 
 [[events]]

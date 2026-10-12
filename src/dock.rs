@@ -97,12 +97,13 @@ fn place(without_agent: bool) -> Result<()> {
     guard.save()
 }
 
-/// The pane a `pane.closed` hook is about. The event names only the pane: herdr's context then
-/// describes whichever tab is focused, so the tab comes from the dock state instead.
+/// The pane a `pane.closed` or `pane.exited` hook is about (a pane whose shell exits is gone
+/// without a `pane.closed`). The event names only the pane: herdr's context then describes
+/// whichever tab is focused, so the tab comes from the dock state instead.
 fn closed_pane() -> Option<String> {
     let event: serde_json::Value = serde_json::from_str(&std::env::var("HERDR_PLUGIN_EVENT_JSON").ok()?).ok()?;
     let data = &event["data"];
-    (data["type"] == "pane_closed").then(|| data["pane_id"].as_str().map(str::to_string)).flatten()
+    matches!(data["type"].as_str(), Some("pane_closed" | "pane_exited")).then(|| data["pane_id"].as_str().map(str::to_string)).flatten()
 }
 
 /// The Tracks panes of tabs that hold nothing else: the agent and every other pane closed.
