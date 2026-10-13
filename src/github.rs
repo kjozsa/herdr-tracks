@@ -1,6 +1,7 @@
 //! GitHub pull requests: recognising PR URLs, matching them to local checkouts by remote,
 //! and reading state + CI rollup through the `gh` CLI.
 
+use crate::git::{FileChange, LineStat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -118,20 +119,58 @@ pub struct PrStatus {
 }
 
 /// What the sidebar fetches of a pull request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PrView {
     pub status: PrStatus,
-    /// Hashes of the commits it holds, plus its merge commit (with a squash merge, the only
-    /// one on the base branch).
-    pub commits: Vec<String>,
+    pub title: String,
+    /// Its commits, oldest first as GitHub lists them.
+    pub commits: Vec<PrCommit>,
+    /// The merge commit once merged (with a squash merge, the only one on the base branch).
+    pub merge: Option<PrCommit>,
+    /// Last activity on GitHub (pushes, reviews, merging), unix seconds.
+    pub updated: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrCommit {
+    pub oid: String,
+    /// First line of the message; GitHub does not give it for the merge commit.
+    pub subject: Option<String>,
+    /// Committed, unix seconds.
+    pub time: Option<i64>,
+}
+
+impl PrView {
+    /// Hashes of every commit it holds, the merge commit included.
+    pub fn holds(&self, hash: &str) -> bool {
+        self.commits.iter().chain(&self.merge).any(|c| c.oid == hash)
+    }
 }
 
 pub fn pr_view(pr: &PrRef) -> Result<PrView, String> {
-    let json = gh(&["pr", "view", &pr.url(), "--json", "state,isDraft,statusCheckRollup,commits,mergeCommit"])?;
+    let fields = "state,isDraft,statusCheckRollup,title,commits,mergeCommit,mergedAt,updatedAt";
+    let json = gh(&["pr", "view", &pr.url(), "--json", fields])?;
     let json: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
-    let oids = json["commits"].as_array().into_iter().flatten().map(|c| &c["oid"]).chain([&json["mergeCommit"]["oid"]]);
-    let commits = oids.filter_map(|oid| oid.as_str().map(str::to_string)).collect();
-    Ok(PrView { status: parse_status(&json), commits })
+    Ok(parse_view(&json))
+}
+
+fn parse_view(json: &Value) -> PrView {
+    let secs = |v: &Value| v.as_str().and_then(crate::transcript::unix_ms).map(|ms| ms / 1000);
+    let commits = json["commits"].as_array().into_iter().flatten().filter_map(|c| {
+        Some(PrCommit {
+            oid: c["oid"].as_str()?.to_string(),
+            subject: c["messageHeadline"].as_str().map(str::to_string),
+            time: secs(&c["committedDate"]),
+        })
+    });
+    let merge = json["mergeCommit"]["oid"].as_str().map(|oid| PrCommit { oid: oid.to_string(), subject: None, time: secs(&json["mergedAt"]) });
+    PrView {
+        status: parse_status(json),
+        title: json["title"].as_str().unwrap_or_default().to_string(),
+        commits: commits.collect(),
+        merge,
+        updated: secs(&json["updatedAt"]),
+    }
 }
 
 fn parse_status(json: &Value) -> PrStatus {
@@ -165,35 +204,34 @@ fn rollup(checks: &[Value]) -> Option<Checks> {
     result
 }
 
-/// One file of a pull request, as `gh pr view --json files` reports it.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct PrFile {
-    pub path: String,
-    #[serde(rename = "changeType", default)]
-    pub change_type: String,
-    #[serde(default)]
-    pub additions: u32,
-    #[serde(default)]
-    pub deletions: u32,
+/// The files a commit of `slug` (`owner/repo`) changes, from GitHub.
+pub fn commit_files(slug: &str, hash: &str) -> Result<Vec<FileChange>, String> {
+    let json = gh(&["api", &format!("repos/{slug}/commits/{hash}")])?;
+    let json: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
+    Ok(parse_commit_files(&json))
 }
 
-impl PrFile {
-    /// Status letter in the style of `git status`: `A`, `D`, `R`, `C` or `M`.
-    pub fn code(&self) -> char {
-        match self.change_type.as_str() {
-            "ADDED" => 'A',
-            "DELETED" => 'D',
-            "RENAMED" => 'R',
-            "COPIED" => 'C',
-            _ => 'M',
-        }
-    }
+fn parse_commit_files(json: &Value) -> Vec<FileChange> {
+    let count = |v: &Value| v.as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+    let files = json["files"].as_array().into_iter().flatten();
+    files
+        .filter_map(|f| {
+            let code = match f["status"].as_str()? {
+                "added" => 'A',
+                "removed" => 'D',
+                "renamed" => 'R',
+                "copied" => 'C',
+                _ => 'M',
+            };
+            let stat = LineStat::Lines { added: count(&f["additions"]), removed: count(&f["deletions"]) };
+            Some(FileChange { code, path: f["filename"].as_str()?.to_string(), stat })
+        })
+        .collect()
 }
 
-pub fn pr_files(url: &str) -> Result<Vec<PrFile>, String> {
-    let json = gh(&["pr", "view", url, "--json", "files"])?;
-    let mut value: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
-    serde_json::from_value(value["files"].take()).map_err(|e| format!("gh files: {e}"))
+/// A commit's whole patch, from GitHub.
+pub fn commit_diff(slug: &str, hash: &str) -> Result<String, String> {
+    gh(&["api", "-H", "Accept: application/vnd.github.diff", &format!("repos/{slug}/commits/{hash}")])
 }
 
 /// The pull request's whole patch.
@@ -265,5 +303,32 @@ mod tests {
         assert_eq!(patch_section(patch, "new name.rs"), Some("diff --git a/old name.rs b/new name.rs\nsimilarity index 90%\n"));
         assert_eq!(patch_section(patch, "c.rs"), Some("diff --git a/c.rs b/c.rs\n+mentions diff --git a/zz b/zz inline\n"));
         assert_eq!(patch_section(patch, "zz"), None, "only headers at line starts count");
+    }
+
+    #[test]
+    fn pr_view_holds_its_commits_and_merge_commit() {
+        let view = parse_view(&json!({
+            "state": "MERGED",
+            "commits": [{"oid": "a1", "messageHeadline": "first", "committedDate": "2026-10-13T07:04:58Z"}],
+            "mergeCommit": {"oid": "m9"},
+            "mergedAt": "2026-10-13T09:35:45Z",
+            "updatedAt": "2026-10-13T09:35:46Z"
+        }));
+        assert_eq!(view.commits, [PrCommit { oid: "a1".into(), subject: Some("first".into()), time: Some(1_791_875_098) }]);
+        assert_eq!(view.merge, Some(PrCommit { oid: "m9".into(), subject: None, time: Some(1_791_884_145) }));
+        assert!(view.holds("a1") && view.holds("m9") && !view.holds("zz"));
+        assert_eq!(view.updated, Some(1_791_884_146));
+    }
+
+    #[test]
+    fn commit_files_from_the_github_api() {
+        let files = parse_commit_files(&json!({"files": [
+            {"filename": "a.rs", "status": "modified", "additions": 3, "deletions": 1},
+            {"filename": "b.rs", "status": "renamed", "previous_filename": "old.rs", "additions": 0, "deletions": 0},
+            {"filename": "c.rs", "status": "removed", "additions": 0, "deletions": 9}
+        ]}));
+        let codes: Vec<(char, &str)> = files.iter().map(|f| (f.code, f.path.as_str())).collect();
+        assert_eq!(codes, [('M', "a.rs"), ('R', "b.rs"), ('D', "c.rs")]);
+        assert_eq!(files[0].stat, LineStat::Lines { added: 3, removed: 1 });
     }
 }

@@ -314,7 +314,7 @@ fn message_text(content: &Value) -> String {
 
 /// Unix milliseconds of an RFC 3339 UTC timestamp as agents write them:
 /// `2026-10-12T08:55:29.567Z` (fraction optional).
-fn unix_ms(ts: &str) -> Option<i64> {
+pub fn unix_ms(ts: &str) -> Option<i64> {
     let num = |range: std::ops::Range<usize>| ts.get(range)?.parse::<i64>().ok();
     let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);

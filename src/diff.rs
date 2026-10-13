@@ -1,8 +1,9 @@
-//! The diff pane: a small viewer for the diff selected in the sidebar, either a changed local
-//! file or (part of) a pull request. The sidebar names it in a request file and the viewer
-//! redraws when that changes, so browsing swaps the content in place instead of opening panes.
+//! The diff pane: a small viewer for the diff selected in the sidebar: a changed local file,
+//! a commit (or one file of it), or a pull request. The sidebar names it in a request file and
+//! the viewer redraws when that changes, so browsing swaps the content in place instead of
+//! opening panes.
 
-use crate::git::Change;
+use crate::git::{self, Change, FileChange};
 use crate::term::Term;
 use crate::{ansi, github, herdr};
 use anyhow::{Context, Result};
@@ -24,8 +25,8 @@ pub const OWNER_ENV: &str = "TRACKS_DIFF_OWNER";
 const POLL: Duration = Duration::from_millis(50);
 /// How often the viewer checks that its sidebar still exists.
 const OWNER_CHECK: Duration = Duration::from_secs(1);
-/// How long a fetched pull-request patch is reused before fetching it again.
-const PR_PATCH_TTL: Duration = Duration::from_secs(30);
+/// How long a patch fetched from GitHub is reused before fetching it again.
+const FETCHED_TTL: Duration = Duration::from_secs(30);
 const WHEEL_LINES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,11 +36,11 @@ pub enum DiffRequest {
     Local { root: PathBuf, path: String, orig: Option<String>, untracked: bool },
     /// What the unpushed commits change in one file of a local checkout (`@{u}...HEAD`).
     Unpushed { root: PathBuf, path: String },
-    /// One commit of a local checkout: its message and what it changes (a merge: against its
-    /// first parent, i.e. what it brought in).
-    Commit { root: PathBuf, hash: String },
-    /// A pull request's patch: one file of it, or all of it.
-    Pr { url: String, path: Option<String> },
+    /// A commit, its message and what it changes (a merge: against its first parent, i.e.
+    /// what it brought in); or one file of it.
+    Commit { commit: CommitAt, path: Option<String> },
+    /// A pull request's whole patch.
+    Pr { url: String },
 }
 
 impl DiffRequest {
@@ -50,6 +51,39 @@ impl DiffRequest {
             orig: change.orig.clone(),
             untracked: change.untracked(),
         }
+    }
+}
+
+/// A commit and where to read it: the local checkout when it has the commit, else GitHub.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CommitAt {
+    pub hash: String,
+    pub root: Option<PathBuf>,
+    /// `owner/repo` on GitHub.
+    pub repo: Option<String>,
+}
+
+impl CommitAt {
+    /// The checkout to read it from, when it has the commit.
+    fn local(&self) -> Option<&Path> {
+        self.root.as_deref().filter(|root| git::commit_exists(root, &self.hash))
+    }
+
+    fn remote(&self) -> Result<&str, String> {
+        self.repo.as_deref().ok_or_else(|| format!("{} is in no local checkout and no known GitHub repo", self.hash))
+    }
+
+    /// The files it changes, with line counts.
+    pub fn files(&self) -> Result<Vec<FileChange>, String> {
+        match self.local() {
+            Some(root) => git::commit_files(root, &self.hash),
+            None => github::commit_files(self.remote()?, &self.hash),
+        }
+    }
+
+    /// Its page on GitHub.
+    pub fn url(&self) -> Option<String> {
+        Some(format!("https://github.com/{}/commit/{}", self.repo.as_deref()?, self.hash))
     }
 }
 
@@ -82,8 +116,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Fetched pull-request patches by URL, with when they were fetched.
-type PrPatches = HashMap<String, (Instant, Result<String, String>)>;
+/// Patches fetched from GitHub (pull requests, commits not in a checkout), by URL, with when
+/// they were fetched.
+type Patches = HashMap<String, (Instant, Result<String, String>)>;
 
 /// Shows the requested diff until `q`/`Esc`, re-rendering when the request or width changes.
 /// `w` wraps long lines, or cuts them at the edge again. Also ends once `owner` (the sidebar
@@ -96,7 +131,7 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
     // The rows on screen (`lines`, wrapped or not) and, per row, its line in `lines`.
     let mut shown: Vec<String> = Vec::new();
     let mut origin: Vec<usize> = Vec::new();
-    let mut patches = PrPatches::new();
+    let mut patches = Patches::new();
     let mut scroll = 0usize;
     let mut dirty = true;
     let mut next_owner_check = Instant::now() + OWNER_CHECK;
@@ -178,12 +213,14 @@ fn layout(lines: &[String], wrap: bool, cols: u16) -> (Vec<String>, Vec<usize>) 
 }
 
 /// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
-fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut PrPatches) -> Vec<String> {
+fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut Patches) -> Vec<String> {
     let (patch, repo) = match request {
-        DiffRequest::Local { root, .. } | DiffRequest::Unpushed { root, .. } | DiffRequest::Commit { root, .. } => {
-            (local_patch(request, root), Some(root.as_path()))
-        }
-        DiffRequest::Pr { url, path } => (pr_patch(patches, url, path.as_deref()), None),
+        DiffRequest::Local { root, .. } | DiffRequest::Unpushed { root, .. } => (local_patch(request, root), Some(root.as_path())),
+        DiffRequest::Commit { commit, path } => match commit.local() {
+            Some(root) => (local_patch(request, root), Some(root)),
+            None => (remote_commit_patch(patches, commit, path.as_deref()), None),
+        },
+        DiffRequest::Pr { url } => (fetched(patches, url, || github::pr_diff(url)), None),
     };
     let patch = match patch {
         Ok(patch) if patch.trim().is_empty() => return vec!["no changes".into()],
@@ -210,17 +247,24 @@ fn local_patch(request: &DiffRequest, root: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The pull request's patch, or one file of it; fetched once per [`PR_PATCH_TTL`].
-fn pr_patch(patches: &mut PrPatches, url: &str, path: Option<&str>) -> Result<String, String> {
-    let fresh = patches.get(url).is_some_and(|(at, _)| at.elapsed() < PR_PATCH_TTL);
-    if !fresh {
-        patches.insert(url.to_string(), (Instant::now(), github::pr_diff(url)));
-    }
-    let patch = patches[url].1.as_ref().map_err(String::clone)?;
+/// A commit from GitHub, or one file of it.
+fn remote_commit_patch(patches: &mut Patches, commit: &CommitAt, path: Option<&str>) -> Result<String, String> {
+    let repo = commit.remote()?;
+    let url = commit.url().unwrap_or_default();
+    let patch = fetched(patches, &url, || github::commit_diff(repo, &commit.hash))?;
     match path {
-        None => Ok(patch.clone()),
-        Some(path) => github::patch_section(patch, path).map(str::to_string).ok_or_else(|| format!("{path} is not in this PR")),
+        None => Ok(patch),
+        Some(path) => github::patch_section(&patch, path).map(str::to_string).ok_or_else(|| format!("{path} is not in this commit")),
     }
+}
+
+/// What `fetch` returns, fetched once per [`FETCHED_TTL`] for `url`.
+fn fetched(patches: &mut Patches, url: &str, fetch: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    let fresh = patches.get(url).is_some_and(|(at, _)| at.elapsed() < FETCHED_TTL);
+    if !fresh {
+        patches.insert(url.to_string(), (Instant::now(), fetch()));
+    }
+    patches[url].1.clone()
 }
 
 /// The user's `core.pager` (as seen from `repo`) when it is delta.
@@ -279,12 +323,18 @@ fn colorize(patch: &str) -> String {
 }
 
 /// Local changes: staged and unstaged together (`git diff HEAD`), untracked files as all-new;
-/// unpushed commits: what a push would add (`@{u}...HEAD`); a commit: `git show`.
+/// unpushed commits: what a push would add (`@{u}...HEAD`); a commit: `git show`, of one file
+/// or all.
 fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
-    if let DiffRequest::Commit { hash, .. } = request {
-        return ["show", "--color=never", "--format=fuller", "--diff-merges=first-parent", "-M", hash.as_str()]
-            .map(String::from)
-            .to_vec();
+    if let DiffRequest::Commit { commit, path } = request {
+        let mut args: Vec<String> =
+            ["show", "--color=never", "--format=fuller", "--diff-merges=first-parent", "-M", commit.hash.as_str()]
+                .map(String::from)
+                .to_vec();
+        if let Some(path) = path {
+            args.extend(["--".into(), path.clone()]);
+        }
+        return args;
     }
     let mut args: Vec<String> = vec!["diff".into(), "--color=never".into()];
     match request {

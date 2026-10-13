@@ -8,9 +8,9 @@
 mod collect;
 mod render;
 
-use crate::diff::{self, DiffRequest};
-use crate::git::{Change, Commit, RepoStatus};
-use crate::github::{self, PrFile, PrRef};
+use crate::diff::{self, CommitAt, DiffRequest};
+use crate::git::{Change, Commit, FileChange, RepoStatus};
+use crate::github::{PrRef, PrView};
 use crate::herdr;
 use crate::state::{self, DismissedLink, DismissedRepo, SessionRepos};
 use crate::transcript::Transcript;
@@ -55,9 +55,9 @@ struct Model {
     statuses: Statuses,
     /// Commits the chat made, per repo, newest first.
     commits: HashMap<PathBuf, Vec<Commit>>,
-    /// Hashes of each pull request's commits and merge commit, by URL: the chat's commits
-    /// among them are listed under the pull request.
-    pr_commits: HashMap<String, Vec<String>>,
+    /// Each pull request's commits, merge commit and last activity, by URL: the chat's commits
+    /// among them are listed under the pull request, which sorts by the newest of them.
+    pr_views: HashMap<String, PrView>,
     error: Option<String>,
     /// github.com `owner/repo` slugs of each checkout's remotes.
     remotes: HashMap<PathBuf, Vec<String>>,
@@ -69,11 +69,12 @@ struct Model {
     diff_pane: Option<String>,
     /// Row chosen with the arrow keys or a click; its diff is shown.
     selected: Option<Key>,
-    /// Pull requests expanded to list their files, by URL.
+    /// Pull requests (by URL) expanded to list their commits, and commits (by hash) expanded
+    /// to list their files.
     expanded: HashSet<String>,
-    /// Files of expanded pull requests, by URL; absent while loading.
-    pr_files: HashMap<String, Result<Vec<PrFile>, String>>,
-    /// In-flight file list fetches (run `gh` off the UI thread).
+    /// Files of expanded commits, by hash; absent while loading.
+    commit_files: HashMap<String, Result<Vec<FileChange>, String>>,
+    /// In-flight file list fetches (run `git` or `gh` off the UI thread).
     files_jobs: Vec<Receiver<FilesFetched>>,
     /// This sidebar's own pane id; names the request file its diff viewer follows.
     me: String,
@@ -86,6 +87,9 @@ struct Model {
     hover: Option<String>,
     /// How many of the newest links the links block is scrolled past.
     links_scroll: usize,
+    /// Whether the selection was made with the keys: only then is it drawn highlighted (and
+    /// kept in view). A clicked row needs no marking.
+    keyboard: bool,
 }
 
 impl Model {
@@ -97,22 +101,23 @@ impl Model {
     }
 }
 
-/// A pull request's file list, fetched in the background, by URL.
-type FilesFetched = (String, Result<Vec<PrFile>, String>);
+/// A commit's file list, fetched in the background, by hash.
+type FilesFetched = (String, Result<Vec<FileChange>, String>);
 
 /// What a sidebar row is: selecting or clicking it shows its diff.
 #[derive(Debug, Clone, PartialEq)]
 enum Click {
     /// A changed file in a local checkout.
     File { root: PathBuf, change: Change },
-    /// A pull request; expands to its files.
+    /// A pull request; expands to its commits.
     Pr { url: String },
-    /// One file of an expanded pull request.
-    PrFile { url: String, path: String },
     /// A file changed by commits not yet pushed.
     Unpushed { root: PathBuf, path: String },
-    /// A commit the chat made.
-    Commit { root: PathBuf, hash: String },
+    /// A commit, listed on its own or (`under`) in an expanded pull request; expands to its
+    /// files.
+    Commit { commit: CommitAt, under: Option<String> },
+    /// One file of an expanded commit.
+    CommitFile { commit: CommitAt, path: String },
 }
 
 /// Identity of a selectable row that survives refreshes (a file's status code may change).
@@ -120,9 +125,9 @@ enum Click {
 enum Key {
     File(PathBuf, String),
     Pr(String),
-    PrFile(String, String),
     Unpushed(PathBuf, String),
-    Commit(PathBuf, String),
+    Commit(String),
+    CommitFile(String, String),
 }
 
 impl Click {
@@ -130,19 +135,28 @@ impl Click {
         match self {
             Click::File { root, change } => Key::File(root.clone(), change.path.clone()),
             Click::Pr { url } => Key::Pr(url.clone()),
-            Click::PrFile { url, path } => Key::PrFile(url.clone(), path.clone()),
             Click::Unpushed { root, path } => Key::Unpushed(root.clone(), path.clone()),
-            Click::Commit { root, hash } => Key::Commit(root.clone(), hash.clone()),
+            Click::Commit { commit, .. } => Key::Commit(commit.hash.clone()),
+            Click::CommitFile { commit, path } => Key::CommitFile(commit.hash.clone(), path.clone()),
         }
     }
 
     fn diff_request(&self) -> DiffRequest {
         match self {
             Click::File { root, change } => DiffRequest::local(root, change),
-            Click::Pr { url } => DiffRequest::Pr { url: url.clone(), path: None },
-            Click::PrFile { url, path } => DiffRequest::Pr { url: url.clone(), path: Some(path.clone()) },
+            Click::Pr { url } => DiffRequest::Pr { url: url.clone() },
             Click::Unpushed { root, path } => DiffRequest::Unpushed { root: root.clone(), path: path.clone() },
-            Click::Commit { root, hash } => DiffRequest::Commit { root: root.clone(), hash: hash.clone() },
+            Click::Commit { commit, .. } => DiffRequest::Commit { commit: commit.clone(), path: None },
+            Click::CommitFile { commit, path } => DiffRequest::Commit { commit: commit.clone(), path: Some(path.clone()) },
+        }
+    }
+
+    /// The page it opens in the browser: a pull request's, or a commit's on GitHub.
+    fn url(&self) -> Option<String> {
+        match self {
+            Click::Pr { url } => Some(url.clone()),
+            Click::Commit { commit, .. } | Click::CommitFile { commit, .. } => commit.url(),
+            _ => None,
         }
     }
 }
@@ -215,7 +229,7 @@ fn event_loop(me: &str) -> Result<()> {
         let (cols, rows) = terminal::size()?;
         let (cols, rows) = (usize::from(cols), usize::from(rows));
         let screen = render::render(&model, cols);
-        let selected_row = screen.row_of(model.selected.as_ref());
+        let selected_row = screen.row_of(model.selected.as_ref()).filter(|_| model.keyboard);
         // The links block takes at most half the pane; the list scrolls above it.
         let mut links_scroll = model.links_scroll;
         let block = render::links(&model, cols, rows / 2, &mut links_scroll);
@@ -246,6 +260,11 @@ fn refresh(model: &mut Model, due: &mut Due) {
     let now = Instant::now();
     if now >= due.sample {
         due.sample = now + SAMPLE_EVERY;
+        // A diff pane closed from its own side (`q`, or herdr) leaves nothing selected.
+        if model.diff_pane.as_deref().is_some_and(|pane| !herdr::pane_exists(pane)) {
+            model.diff_pane = None;
+            model.selected = None;
+        }
         let me = model.me.clone();
         match collect::sample(&me, model) {
             Ok(new_repos) => {
@@ -278,10 +297,10 @@ fn refresh(model: &mut Model, due: &mut Due) {
         due.pr = now + PR_EVERY;
         model.pr_job = collect::start_pr_refresh(model);
     }
-    let Model { files_jobs, pr_files, .. } = model;
+    let Model { files_jobs, commit_files, .. } = model;
     files_jobs.retain(|job| match job.try_recv() {
-        Ok((url, files)) => {
-            pr_files.insert(url, files);
+        Ok((hash, files)) => {
+            commit_files.insert(hash, files);
             false
         }
         Err(TryRecvError::Empty) => true,
@@ -307,13 +326,21 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
             model.menu = view.menus.get(&row).map(|target| Menu { target: target.clone(), row });
             Ok(())
         }
-        (None, Event::Key(KeyEvent { code, .. })) => handle_key(model, screen, code),
-        (None, Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, modifiers, .. })) => {
-            if let Some(url) = view.links.get(&usize::from(row)) {
+        (None, Event::Key(KeyEvent { code, .. })) => {
+            model.keyboard = true;
+            handle_key(model, screen, code)
+        }
+        (None, Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), row, column, modifiers })) => {
+            let row = usize::from(row);
+            if let Some(url) = view.links.get(&row) {
                 return open_url(url);
             }
-            match view.clicks.get(&usize::from(row)) {
-                Some(click) => handle_click(model, click, modifiers.contains(KeyModifiers::CONTROL)),
+            let zone = view.lines.get(row).map_or(render::Zone::Body, |line| render::zone(line, usize::from(column)));
+            match view.clicks.get(&row) {
+                Some(click) => {
+                    model.keyboard = false;
+                    handle_click(model, click, modifiers.contains(KeyModifiers::CONTROL), zone)
+                }
                 None => Ok(()),
             }
         }
@@ -332,9 +359,9 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
             model.hover = None;
             Ok(())
         }
-        (menu, Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, row, .. })) => {
+        (menu, Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, row, column, .. })) => {
             model.menu = menu;
-            model.hover = view.url_at(usize::from(row)).map(str::to_string);
+            model.hover = view.pointer_url(usize::from(row), usize::from(column)).map(str::to_string);
             Ok(())
         }
         // Mouse releases and drags, focus changes: an open menu stays open.
@@ -345,9 +372,11 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
     }
 }
 
-/// ↑/↓ (`k`/`j`) select rows, →/← (`l`/`h`) expand and collapse pull requests, `o` opens the
-/// selected pull request in the browser, Enter focuses the diff, Esc closes it.
+/// ↑/↓ (`k`/`j`) select rows, →/← (`l`/`h`) expand and collapse pull requests and commits,
+/// `o` opens the selected pull request or commit in the browser, Enter focuses the diff, Esc
+/// closes it.
 fn handle_key(model: &mut Model, screen: &Screen, code: KeyCode) -> Result<()> {
+    let selected = model.selected.as_ref().and_then(|key| screen.rows().into_iter().find(|(_, c)| c.key() == *key)).map(|(_, c)| c.clone());
     match code {
         KeyCode::Down | KeyCode::Char('j') => match move_selection(model, screen, 1) {
             Some(request) => show_diff(model, &request),
@@ -358,27 +387,43 @@ fn handle_key(model: &mut Model, screen: &Screen, code: KeyCode) -> Result<()> {
             None => Ok(()),
         },
         KeyCode::Right | KeyCode::Char('l') => {
-            if let Some(Key::Pr(url)) = &model.selected {
-                expand(model, url.clone());
+            match selected {
+                Some(Click::Pr { url }) => {
+                    model.expanded.insert(url);
+                }
+                Some(Click::Commit { commit, .. }) => expand_commit(model, &commit),
+                _ => {}
             }
             Ok(())
         }
-        KeyCode::Left | KeyCode::Char('h') => match model.selected.clone() {
-            Some(Key::Pr(url)) => {
+        // Collapses the selected row, or else the one it is listed in, and selects that.
+        KeyCode::Left | KeyCode::Char('h') => match selected {
+            Some(Click::Pr { url }) => {
                 model.expanded.remove(&url);
                 Ok(())
             }
-            Some(Key::PrFile(url, _)) => {
+            Some(Click::Commit { commit, under }) => {
+                if model.expanded.remove(&commit.hash) {
+                    return Ok(());
+                }
+                let Some(url) = under else { return Ok(()) };
                 model.expanded.remove(&url);
-                model.selected = Some(Key::Pr(url.clone()));
-                show_diff(model, &DiffRequest::Pr { url, path: None })
+                handle_select(model, &Click::Pr { url })
+            }
+            Some(Click::CommitFile { commit, .. }) => {
+                model.expanded.remove(&commit.hash);
+                let under = screen.rows().into_iter().find_map(|(_, c)| match c {
+                    Click::Commit { commit: c, under } if c.hash == commit.hash => Some(under.clone()),
+                    _ => None,
+                });
+                handle_select(model, &Click::Commit { commit, under: under.flatten() })
             }
             _ => Ok(()),
         },
         KeyCode::Char('C') => dismiss(model, &Target::Links),
-        KeyCode::Char('o') => match &model.selected {
-            Some(Key::Pr(url) | Key::PrFile(url, _)) => open_url(url),
-            _ => Ok(()),
+        KeyCode::Char('o') => match selected.and_then(|c| c.url()) {
+            Some(url) => open_url(&url),
+            None => Ok(()),
         },
         KeyCode::Enter => match &model.diff_pane {
             Some(pane) => herdr::pane_focus(pane),
@@ -414,16 +459,17 @@ fn move_selection(model: &mut Model, screen: &Screen, step: isize) -> Option<Dif
     Some(click.diff_request())
 }
 
-/// Lists a pull request's files under it, fetching them in the background.
-fn expand(model: &mut Model, url: String) {
-    if !model.expanded.insert(url.clone()) {
+/// Lists a commit's files under it, fetching them in the background the first time.
+fn expand_commit(model: &mut Model, commit: &CommitAt) {
+    model.expanded.insert(commit.hash.clone());
+    if model.commit_files.contains_key(&commit.hash) {
         return;
     }
-    model.pr_files.remove(&url); // refetch: an open PR may have changed
     let (tx, rx) = mpsc::channel();
+    let commit = commit.clone();
     std::thread::spawn(move || {
-        let files = github::pr_files(&url);
-        let _ = tx.send((url, files));
+        let files = commit.files();
+        let _ = tx.send((commit.hash, files));
     });
     model.files_jobs.push(rx);
 }
@@ -484,16 +530,33 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clicking selects the row and shows its diff; a pull request row also expands or collapses.
-/// Ctrl+click on a pull request opens it in the browser.
-fn handle_click(model: &mut Model, click: &Click, ctrl: bool) -> Result<()> {
-    if let (Click::Pr { url }, true) = (click, ctrl) {
-        return open_url(url);
+/// A click on a row: its expand marker expands or collapses a pull request or commit; a pull
+/// request's number and status open it in the browser; anywhere else selects the row and
+/// shows its diff. Ctrl+click opens a pull request or commit in the browser.
+fn handle_click(model: &mut Model, click: &Click, ctrl: bool, zone: render::Zone) -> Result<()> {
+    if let (Some(url), true) = (click.url(), ctrl) {
+        return open_url(&url);
     }
-    if let Click::Pr { url } = click
-        && !model.expanded.remove(url) {
-            expand(model, url.clone());
+    match (click, zone) {
+        (Click::Pr { url }, render::Zone::Marker) => {
+            if !model.expanded.remove(url) {
+                model.expanded.insert(url.clone());
+            }
+            Ok(())
         }
+        (Click::Pr { url }, render::Zone::Link) => open_url(url),
+        (Click::Commit { commit, .. }, render::Zone::Marker) => {
+            if !model.expanded.remove(&commit.hash) {
+                expand_commit(model, commit);
+            }
+            Ok(())
+        }
+        _ => handle_select(model, click),
+    }
+}
+
+/// Selects the row and shows its diff.
+fn handle_select(model: &mut Model, click: &Click) -> Result<()> {
     model.selected = Some(click.key());
     show_diff(model, &click.diff_request())
 }
@@ -517,6 +580,7 @@ fn show_diff(model: &mut Model, request: &DiffRequest) -> Result<()> {
 mod tests {
     use super::*;
     use crate::git::LineStat;
+    use crate::github::{PrCommit, PrState, PrStatus};
     use crate::state::{PrRecord, RepoRecord};
     use render::{render, repo_header, window};
     use unicode_width::UnicodeWidthStr;
@@ -560,32 +624,71 @@ mod tests {
         assert_eq!(unpushed, DiffRequest::Unpushed { root: root.clone(), path: "e2e/b.py".into() });
 
         // The chat's commits follow, newest first, ten at most; one more row counts the rest.
-        let commit = |n: i64| Commit { hash: format!("h{n}"), short: format!("s{n}"), time: n, subject: format!("commit {n}") };
+        let commit = |n: i64| Commit { hash: format!("h{n}"), time: n, subject: format!("commit {n}") };
         model.commits.insert(root.clone(), (0..12).rev().map(commit).collect());
         let screen = render(&model, 40);
         let rows: Vec<Key> = screen.rows().into_iter().skip(2).map(|(_, c)| c.key()).collect();
-        assert_eq!(rows, (2..12).rev().map(|n| Key::Commit(root.clone(), format!("h{n}"))).collect::<Vec<_>>());
+        assert_eq!(rows, (2..12).rev().map(|n| Key::Commit(format!("h{n}"))).collect::<Vec<_>>());
         let text = |line: &render::Line| line.iter().map(|(t, _)| t.as_str()).collect::<String>();
         let last = screen.lines.len() - 1;
-        assert_eq!(text(&screen.lines[last - 1]), " ● s2 commit 2");
+        assert_eq!(text(&screen.lines[last - 1]), " ▸ h2 commit 2");
         assert_eq!(text(&screen.lines[last]), "   … 2 earlier commits");
-        let request = screen.rows()[2].1.diff_request();
-        assert_eq!(request, DiffRequest::Commit { root: root.clone(), hash: "h11".into() });
+        let at = |hash: &str, repo: Option<&str>| CommitAt { hash: hash.into(), root: Some(root.clone()), repo: repo.map(String::from) };
+        assert_eq!(screen.rows()[2].1.diff_request(), DiffRequest::Commit { commit: at("h11", None), path: None });
 
-        // Commits a pull request holds move under it, ahead of the uncommitted files.
-        let pr = PrRef { owner: "o".into(), repo: "e2e".into(), number: 5 };
-        model.pr_commits.insert(pr.url(), vec!["h11".into(), "h3".into(), "elsewhere".into()]);
+        // Pull requests join the commits in one list, freshest first: a PR by the newest of the
+        // chat's commits it holds (or its last activity on GitHub). A PR not fetched yet goes last.
+        let pr = |number| PrRef { owner: "o".into(), repo: "e2e".into(), number };
+        let status = PrStatus { state: PrState::Open, checks: None };
+        let gh = |oid: &str, subject: &str, time| PrCommit { oid: oid.into(), subject: Some(subject.into()), time: Some(time) };
+        let commits = vec![gh("h3", "gh 3", 3), gh("h7", "gh 7", 7), gh("x1", "someone else's", 8)];
+        let title = "lodge every beneficial owner as owner too".to_string();
+        model.pr_views.insert(pr(5).url(), PrView { status, title, commits, merge: None, updated: Some(1) });
         let repos = &mut model.session.as_mut().unwrap().repos;
-        repos.prs.push(PrRecord { pr: pr.clone(), root: Some(root.clone()), status: None });
+        for number in [5, 6] {
+            let status = (number == 5).then_some(status);
+            repos.prs.push(PrRecord { pr: pr(number), root: Some(root.clone()), status });
+        }
+        let keys = |model: &Model| render(model, 40).rows().into_iter().map(|(_, c)| c.key()).collect::<Vec<_>>();
+        let commit_key = |n: i64| Key::Commit(format!("h{n}"));
+        let mut expected = vec![Key::File(root.clone(), "a.py".into()), Key::Unpushed(root.clone(), "e2e/b.py".into())];
+        expected.extend([11, 10, 9, 8].map(commit_key));
+        expected.push(Key::Pr(pr(5).url()));
+        expected.extend([6, 5, 4, 2, 1, 0].map(commit_key));
+        expected.push(Key::Pr(pr(6).url()));
+        assert_eq!(keys(&model), expected);
+        // The title follows the state, cut to fit.
         let screen = render(&model, 40);
-        let keys: Vec<Key> = screen.rows().into_iter().map(|(_, c)| c.key()).collect();
-        assert_eq!(keys[..4], [Key::Pr(pr.url()), Key::Commit(root.clone(), "h11".into()), Key::Commit(root.clone(), "h3".into()), Key::File(root.clone(), "a.py".into())]);
-        let pr_row = screen.rows()[0].0;
-        assert_eq!(text(&screen.lines[pr_row + 1]), "   ● s11 commit 11");
-        let repo_level: Vec<Key> = keys[5..].to_vec();
-        assert_eq!(repo_level.len(), 10, "the other ten stay at repo level, all shown");
-        assert!(!repo_level.contains(&Key::Commit(root.clone(), "h3".into())));
-        assert_eq!(text(&screen.lines[screen.lines.len() - 1]), " ● s0 commit 0");
+        let pr_row = screen.rows().iter().find(|(_, c)| c.key() == Key::Pr(pr(5).url())).unwrap().0;
+        let row: String = screen.lines[pr_row].iter().map(|(t, _)| crate::ansi::fit(t, 99)).collect();
+        assert_eq!(crate::ansi::width(&row), 40);
+        assert!(row.ends_with("#5\x1b]8;;\x1b\\ open lodge every beneficial owner…"), "{row:?}");
+        // ` ▸ #5 open lodge…`: the marker expands, number and status open the browser, the title
+        // shows the diff.
+        let zone = |col| render::zone(&screen.lines[pr_row], col);
+        assert_eq!([1, 3, 9, 12].map(zone), [render::Zone::Marker, render::Zone::Link, render::Zone::Link, render::Zone::Body]);
+
+        // Expanded, the PR lists all its commits, newest first: the chat's own marked green,
+        // others dim; and an expanded commit lists its files, each with its diff in the commit.
+        model.expanded.insert(pr(5).url());
+        model.expanded.insert("h7".into());
+        let stat = LineStat::Lines { added: 1, removed: 0 };
+        model.commit_files.insert("h7".into(), Ok(vec![FileChange { code: 'M', path: "a.py".into(), stat }]));
+        let screen = render(&model, 40);
+        let pr_at = screen.rows().iter().position(|(_, c)| c.key() == Key::Pr(pr(5).url())).unwrap();
+        let under: Vec<(usize, &Click)> = screen.rows()[pr_at + 1..pr_at + 5].to_vec();
+        let shown: Vec<String> = under.iter().map(|(row, _)| text(&screen.lines[*row])).collect();
+        assert_eq!(shown[..3], ["   ▸ x1 someone else's", "   ▾ h7 gh 7", "      M a.py                          +1"]);
+        assert_eq!(screen.lines[under[0].0][1].1, render::Tone::Dim, "not the chat's commit");
+        assert_eq!(screen.lines[under[1].0][1].1, render::Tone::Good, "the chat's commit");
+        assert_eq!(under[1].1, &Click::Commit { commit: at("h7", Some("o/e2e")), under: Some(pr(5).url()) });
+        assert_eq!(under[2].1.diff_request(), DiffRequest::Commit { commit: at("h7", Some("o/e2e")), path: Some("a.py".into()) });
+        assert_eq!(under[3].1.key(), commit_key(3));
+        // Only the expand markers toggle: a PR's, a commit's under it; file rows have none.
+        let screen_row = |i: usize| &screen.lines[i];
+        assert_eq!(render::marker_column(screen_row(screen.rows()[pr_at].0)), Some(1));
+        assert_eq!(render::marker_column(screen_row(under[1].0)), Some(3));
+        assert_eq!(render::marker_column(screen_row(under[2].0)), None);
     }
 
     #[test]
@@ -811,11 +914,11 @@ mod tests {
             calls: Vec::new(),
             links: Vec::new(),
         });
-        // Rows: 0 title, 1 blank, 2 repo header, 3 PR, 4 a.rs, 5 b.rs.
+        // Rows: 0 title, 1 blank, 2 repo header, 3 a.rs, 4 b.rs, 5 PR.
         let screen = render(&model, 40);
-        assert_eq!(screen.clicks.get(&3), Some(&Click::Pr { url: pr.url() }));
-        assert_eq!(screen.clicks.get(&4), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
-        assert_eq!(screen.clicks.get(&5), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
+        assert_eq!(screen.clicks.get(&3), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
+        assert_eq!(screen.clicks.get(&4), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
+        assert_eq!(screen.clicks.get(&5), Some(&Click::Pr { url: pr.url() }));
         assert_eq!(screen.clicks.len(), 3);
 
         // Five rows, nothing selected: four content rows plus "… more"; cut-off rows lose clicks.
@@ -823,36 +926,22 @@ mod tests {
         let view = window(&screen, 40, 5, &mut scroll, None);
         assert_eq!(view.lines.len(), 5);
         assert_eq!(view.clicks.keys().copied().collect::<Vec<_>>(), [3]);
-        // A pull request row hovers like a link: its URL is the hover target; a repo header isn't.
-        assert_eq!(view.url_at(3), Some(pr.url().as_str()));
-        assert_eq!(view.url_at(2), None);
 
         // Arrows walk all rows in order (the PR too), report the diff to show, and stop at ends.
-        assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::Pr { url: pr.url(), path: None }));
         assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::local(&root, &change(b" M", "a.rs"))));
         move_selection(&mut model, &screen, 1);
         assert_eq!(model.selected, Some(Key::File(root.clone(), "b.rs".into())));
+        assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::Pr { url: pr.url() }));
         assert_eq!(move_selection(&mut model, &screen, 1), None, "already on the last row");
 
-        // Selecting the last file scrolls it into view; clicks and highlight follow the scroll.
+        // Selecting the last row scrolls it into view; clicks and highlight follow the scroll.
         let view = window(&screen, 40, 5, &mut scroll, screen.row_of(model.selected.as_ref()));
         assert_eq!(scroll, 2);
         assert_eq!(view.highlight, Some(3));
-        assert_eq!(view.clicks.get(&3), Some(&Click::File { root: root.clone(), change: change(b"??", "b.rs") }));
-        assert_eq!(view.clicks.get(&1), Some(&Click::Pr { url: pr.url() }));
-
-        // Expanding the PR lists its files right under it; they are selectable and map to the
-        // PR's per-file diff, and the local files move down.
-        model.expanded.insert(pr.url());
-        let file = PrFile { path: "x.rs".into(), change_type: "ADDED".into(), additions: 5, deletions: 0 };
-        model.pr_files.insert(pr.url(), Ok(vec![file]));
-        let screen = render(&model, 40);
-        assert_eq!(screen.clicks.get(&4), Some(&Click::PrFile { url: pr.url(), path: "x.rs".into() }));
-        assert_eq!(screen.clicks.get(&5), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
-        model.selected = Some(Key::Pr(pr.url()));
-        assert_eq!(
-            move_selection(&mut model, &screen, 1),
-            Some(DiffRequest::Pr { url: pr.url(), path: Some("x.rs".into()) })
-        );
+        assert_eq!(view.clicks.get(&3), Some(&Click::Pr { url: pr.url() }));
+        assert_eq!(view.clicks.get(&1), Some(&Click::File { root: root.clone(), change: change(b" M", "a.rs") }));
+        // A pull request row hovers like a link: its URL is the hover target; a repo header isn't.
+        assert_eq!(view.url_at(3), Some(pr.url().as_str()));
+        assert_eq!(view.url_at(0), None);
     }
 }

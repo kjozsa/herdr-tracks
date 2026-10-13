@@ -177,7 +177,7 @@ pub(super) fn has_unfetched_pr(model: &Model) -> bool {
 
 /// Open PRs change; any PR's commits are fetched once per sidebar (they are not persisted).
 fn needs_fetch(model: &Model, pr: &PrRecord) -> bool {
-    !pr.status.is_some_and(|s| s.state.is_final()) || !model.pr_commits.contains_key(&pr.pr.url())
+    !pr.status.is_some_and(|s| s.state.is_final()) || !model.pr_views.contains_key(&pr.pr.url())
 }
 
 /// Fetches the status and commits of every PR in need (see [`needs_fetch`]) on a background
@@ -209,9 +209,10 @@ pub(super) fn apply_prs(model: &mut Model, batch: PrBatch) -> Result<()> {
     let mut dirty = false;
     for (pr, result) in batch.results {
         match result {
-            Ok(PrView { status, commits }) => {
+            Ok(view) => {
+                let status = view.status;
                 model.pr_errors.remove(&pr.url());
-                model.pr_commits.insert(pr.url(), commits);
+                model.pr_views.insert(pr.url(), view);
                 if let Some(record) = session.repos.prs.iter_mut().find(|r| r.pr == pr && r.status != Some(status)) {
                     record.status = Some(status);
                     dirty = true;

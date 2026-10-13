@@ -232,7 +232,6 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub hash: String,
-    pub short: String,
     /// Committer time, unix seconds.
     pub time: i64,
     pub subject: String,
@@ -247,7 +246,7 @@ pub fn commits_within(root: &Path, windows: &[(i64, i64)]) -> Vec<Commit> {
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(root)
-        .args(["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%h%x1f%ct%x1f%s"])
+        .args(["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%ct%x1f%s"])
         .arg(format!("--since=@{since}"))
         .output();
     match out {
@@ -262,9 +261,9 @@ fn parse_log(text: &str, windows: &[(i64, i64)]) -> Vec<Commit> {
     let mut commits: Vec<Commit> = text
         .lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(4, '\x1f');
-            let (hash, short, time) = (fields.next()?, fields.next()?, fields.next()?.parse().ok()?);
-            Some(Commit { hash: hash.into(), short: short.into(), time, subject: fields.next().unwrap_or_default().into() })
+            let mut fields = line.splitn(3, '\x1f');
+            let (hash, time) = (fields.next()?, fields.next()?.parse().ok()?);
+            Some(Commit { hash: hash.into(), time, subject: fields.next().unwrap_or_default().into() })
         })
         .filter(|c| within(c.time))
         .collect();
@@ -272,23 +271,78 @@ fn parse_log(text: &str, windows: &[(i64, i64)]) -> Vec<Commit> {
     commits
 }
 
+/// A file a commit changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// Status letter as `git status` writes it: `A`, `D`, `R`, `C`, `M`, …
+    pub code: char,
+    /// Path after the commit (the new path of a rename).
+    pub path: String,
+    pub stat: LineStat,
+}
+
+/// Whether the checkout has the commit.
+pub fn commit_exists(root: &Path, hash: &str) -> bool {
+    git_stdout(root, &["cat-file", "-e", &format!("{hash}^{{commit}}")]).is_some()
+}
+
+/// The files a commit changes (a merge: against its first parent), with line counts.
+pub fn commit_files(root: &Path, hash: &str) -> Result<Vec<FileChange>, String> {
+    let show = |format: &str| {
+        git_stdout(root, &["-c", "core.quotePath=false", "show", "--format=", "-z", "-M", "--diff-merges=first-parent", format, hash])
+            .ok_or_else(|| format!("git show {hash} failed"))
+    };
+    let stats = parse_numstat(&show("--numstat")?);
+    Ok(parse_name_status(&show("--name-status")?)
+        .into_iter()
+        .map(|(code, path)| FileChange { code, stat: stats.get(&path).copied().unwrap_or(LineStat::Binary), path })
+        .collect())
+}
+
+/// `--name-status -z`: `M\0path\0`, or `R100\0old\0new\0` for renames and copies.
+fn parse_name_status(text: &str) -> Vec<(char, String)> {
+    let mut files = Vec::new();
+    let mut tokens = text.split('\0').filter(|t| !t.is_empty());
+    while let Some(status) = tokens.next() {
+        let Some(code) = status.chars().next() else { continue };
+        if matches!(code, 'R' | 'C') {
+            tokens.next(); // previous path
+        }
+        if let Some(path) = tokens.next() {
+            files.push((code, path.to_string()));
+        }
+    }
+    files
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git").arg("--no-optional-locks").arg("-C").arg(root).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn name_status_skips_the_old_path_of_renames() {
+        let text = "M\0src/a.rs\0R087\0old name.rs\0new name.rs\0A\0b.rs\0";
+        assert_eq!(parse_name_status(text), [('M', "src/a.rs".into()), ('R', "new name.rs".into()), ('A', "b.rs".into())]);
+    }
+
+    #[test]
     fn commits_count_only_within_the_chat_s_tool_calls() {
         let log = [
-            "a1\x1fa1s\x1f1000\x1fmerge the feature",
-            "b2\x1fb2s\x1f400\x1fold commit merged in",
-            "c3\x1fc3s\x1f990\x1ffix: a | b",
-            "d4\x1fd4s\x1f2000\x1fanother chat's commit",
+            "a1\x1f1000\x1fmerge the feature",
+            "b2\x1f400\x1fold commit merged in",
+            "c3\x1f990\x1ffix: a | b",
+            "d4\x1f2000\x1fanother chat's commit",
         ]
         .join("\n");
         // Two calls: 989.5–995 s and 999–1000.2 s.
         let commits = parse_log(&log, &[(989_500, 995_000), (999_000, 1_000_200)]);
-        let shown: Vec<(&str, &str)> = commits.iter().map(|c| (c.short.as_str(), c.subject.as_str())).collect();
-        assert_eq!(shown, [("a1s", "merge the feature"), ("c3s", "fix: a | b")], "newest first, outside windows left out");
+        let shown: Vec<(&str, &str)> = commits.iter().map(|c| (c.hash.as_str(), c.subject.as_str())).collect();
+        assert_eq!(shown, [("a1", "merge the feature"), ("c3", "fix: a | b")], "newest first, outside windows left out");
     }
 
     const BASE: &str = "# branch.oid 1111\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -1\n";

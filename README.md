@@ -7,11 +7,13 @@ requests it opened or is working on. Select a file or commit to see its diff nex
 
 ```
 herdr-tracks main ↑1
- ▸ #42 open ✓
   M src/sidebar.rs                     +268 -105
  ?? src/ansi.rs                              +80
  ↑  src/git.rs                           +32 -15
- ● 3326d43 list pull requests newest first
+ ▾ #42 open ✓ dock the sidebar
+   ▸ 9e1c2a4 dock the sidebar on the right
+ ▾ 3326d43 list pull requests newest first
+     M src/sidebar/render.rs                +12 -4
 ```
 
 Linux only. Reads omp and Claude Code chat logs; other agents get the repos their processes
@@ -40,10 +42,17 @@ The sidebar follows the focused agent pane of its tab and lists, per repo:
 | Row | Meaning |
 |---|---|
 | `herdr-tracks main ↑1 ↓2` | Repo, checked-out branch, commits ahead of / behind its upstream |
-| ` ▸ #42 open ✓` | A pull request the chat opened or referred to: state and CI checks |
+| ` ▸ #42 open ✓ dock the sidebar` | A pull request the chat opened or referred to: state, CI checks and title; expands into its commits |
 | `  M`, `A `, `??` … | Uncommitted changes, as in `git status`, with lines added/removed |
 | ` ↑ ` | Files changed by commits not pushed yet |
-| ` ● 3326d43 …` | Commits the chat made, newest first (ten, then a count of the rest); those a listed pull request holds, or its merge commit, sit indented under it |
+| ` ▸ 3326d43 …` | A commit; expands into the files it changes. Green marker: the chat made it |
+
+Under each repo, uncommitted work comes first, then pull requests and the chat's other commits
+in one list, freshest first. A pull request counts as fresh as the newest of the chat's
+commits it holds, or its last activity on GitHub. Ten commits outside pull requests are
+listed; one more row counts the older ones. An expanded pull request lists all its commits,
+its merge commit included; those the chat did not make are dimmed. Commits the checkout does
+not have are read from GitHub.
 
 A commit counts as the chat's when it was committed while one of the chat's tool calls ran:
 its own commits, merges and rebases, and pull requests it merged on GitHub; not older commits
@@ -71,9 +80,10 @@ In the sidebar:
 | Input | Action |
 |---|---|
 | `↓` `↑` (`j` `k`) | Select the next / previous file, commit or pull request; its diff opens next to the agent |
-| `→` `←` (`l` `h`) | Expand / collapse a pull request into its files |
-| Click | Select a row and show its diff; on a pull request, also expand or collapse it |
-| `o`, Ctrl+click | Open the selected pull request in the browser |
+| `→` `←` (`l` `h`) | Expand / collapse a pull request into its commits, a commit into its files; `←` on a row inside one collapses it |
+| Click | Select a row and show its diff (a pull request's title: the whole pull request; a commit: the whole commit; a file of a commit: that file) |
+| Click on `▸` / `▾` | Expand / collapse a pull request or commit, without showing its diff |
+| Click on a pull request's number or status, `o`, Ctrl+click | Open the pull request (or the selected commit) on GitHub |
 | Click on a link | Open it in the browser |
 | Right-click | On a repo, pull request or link: dismiss it, or open the pull request / link in the browser; on a link or the links rule: dismiss all links |
 | `C` | Dismiss all links |

@@ -3,8 +3,9 @@
 
 use super::collect::{is_dismissed, visible_prs};
 use super::{Click, Key, Menu, Model, Target};
+use crate::diff::CommitAt;
 use crate::git::{Commit, LineStat, RepoStatus};
-use crate::github::{self, Checks, PrState};
+use crate::github::{self, Checks, PrCommit, PrState};
 use crate::state::PrRecord;
 use anyhow::Result;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
@@ -106,6 +107,15 @@ impl View {
         }
     }
 
+    /// The URL a click at `col` of `row` would open: a link, or a pull request's number and
+    /// status (not its title).
+    pub(super) fn pointer_url(&self, row: usize, col: usize) -> Option<&str> {
+        match self.clicks.get(&row) {
+            Some(Click::Pr { url }) => (zone(self.lines.get(row)?, col) == Zone::Link).then_some(url.as_str()),
+            _ => self.links.get(&row).map(String::as_str),
+        }
+    }
+
     /// Draws the open menu over the rows it occupies.
     pub(super) fn overlay(&mut self, menu: &Menu, cols: usize, rows: usize) {
         for (row, _, label) in menu.placed(rows) {
@@ -135,7 +145,7 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
     }
     // Repos the chat changed or has pull requests in (`refresh_git` skips deleted ones), then
     // PRs whose repo has no touched checkout. Whatever the user dismissed stays hidden.
-    // Newest first within each repo: GitHub numbers pull requests in creation order.
+    // Without a checkout, PRs go newest first by number: GitHub numbers them in creation order.
     let mut prs: Vec<&PrRecord> = visible_prs(&session.repos).collect();
     prs.sort_by_key(|p| (p.pr.slug(), std::cmp::Reverse(p.pr.number)));
     let has_prs = |root: &PathBuf| prs.iter().any(|p| p.root.as_ref() == Some(root));
@@ -157,14 +167,7 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
         }
         menus.insert(lines.len(), Target::Repo(root.clone()));
         lines.push(repo_header(root, model.statuses.get(root), cols));
-        // The commits the chat made here, newest first: those a pull request holds go under it.
-        let mut commits: Vec<&Commit> = model.commits.get(root).into_iter().flatten().collect();
-        for pr in prs.iter().filter(|p| p.root.as_ref() == Some(root)) {
-            let held = model.pr_commits.get(&pr.pr.url()).map_or(&[][..], Vec::as_slice);
-            let (mine, rest): (Vec<&Commit>, Vec<&Commit>) = commits.into_iter().partition(|c| held.contains(&c.hash));
-            commits = rest;
-            push_pr(&mut lines, &mut clicks, &mut menus, model, pr, Some((root, &mine)), cols);
-        }
+        // Uncommitted work first: it is the freshest.
         match model.statuses.get(root) {
             None => {}
             Some(Err(e)) => lines.push(vec![(fit_end(&format!(" ! {e}"), cols), Tone::Error)]),
@@ -182,7 +185,26 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
                 }
             }
         }
-        push_commits(&mut lines, &mut clicks, " ", root, &commits, cols);
+        let entries = history(model, root, prs.iter().copied().filter(|p| p.root.as_ref() == Some(root)));
+        let repo = model.remotes.get(root).and_then(|slugs| slugs.first()).cloned();
+        let mut loose = 0;
+        for entry in &entries {
+            match entry {
+                Entry::Pr { pr, .. } => push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols),
+                Entry::Commit(commit) => {
+                    loose += 1;
+                    if loose <= COMMITS_SHOWN {
+                        let at = CommitAt { hash: commit.hash.clone(), root: Some(root.clone()), repo: repo.clone() };
+                        let row = CommitLine { at, under: None, subject: &commit.subject, chat: true };
+                        push_commit(&mut lines, &mut clicks, model, row, " ", cols);
+                    } else if loose == COMMITS_SHOWN + 1 {
+                        // Older loose commits are counted where the first of them would be.
+                        let more = entries.iter().filter(|e| matches!(e, Entry::Commit(_))).count() - COMMITS_SHOWN;
+                        lines.push(vec![(fit_end(&earlier(" ", more), cols), Tone::Dim)]);
+                    }
+                }
+            }
+        }
     }
     for pr in orphans {
         if !lines.is_empty() {
@@ -190,75 +212,139 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
         }
         menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
         lines.push(vec![(fit_end(&format!("{}/{}", pr.pr.owner, pr.pr.repo), cols), Tone::Repo)]);
-        push_pr(&mut lines, &mut clicks, &mut menus, model, pr, None, cols);
+        push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols);
     }
     Screen { lines, clicks, menus }
 }
 
-/// Commit rows, newest first, [`COMMITS_SHOWN`] at most; one more row counts the rest.
-fn push_commits(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, indent: &str, root: &Path, commits: &[&Commit], cols: usize) {
-    for commit in commits.iter().take(COMMITS_SHOWN) {
-        clicks.insert(lines.len(), Click::Commit { root: root.to_path_buf(), hash: commit.hash.clone() });
-        lines.push(commit_row(indent, commit, cols));
-    }
-    if commits.len() > COMMITS_SHOWN {
-        let more = commits.len() - COMMITS_SHOWN;
-        let text = format!("{indent}  … {more} earlier commit{}", if more == 1 { "" } else { "s" });
-        lines.push(vec![(fit_end(&text, cols), Tone::Dim)]);
+/// What a repo's history lists: a pull request, or a commit of the chat's that no listed pull
+/// request holds.
+enum Entry<'a> {
+    Pr { pr: &'a PrRecord, time: Option<i64> },
+    Commit(&'a Commit),
+}
+
+impl Entry<'_> {
+    /// When it last moved: a commit's time; a PR's newest held commit or GitHub activity.
+    fn time(&self) -> Option<i64> {
+        match self {
+            Entry::Pr { time, .. } => *time,
+            Entry::Commit(commit) => Some(commit.time),
+        }
     }
 }
 
-/// A pull request row, the chat's commits it holds (in the checkout at the path), and, when
-/// expanded, one row per file it changes.
+/// The repo's pull requests and the chat's commits there in one list, freshest first. A PR
+/// is as fresh as the newest of the chat's commits it holds, or its last activity on GitHub;
+/// PRs with neither (not fetched yet) go last.
+fn history<'a>(model: &'a Model, root: &Path, prs: impl Iterator<Item = &'a PrRecord>) -> Vec<Entry<'a>> {
+    let mut loose: Vec<&Commit> = model.commits.get(root).into_iter().flatten().collect();
+    let mut entries: Vec<Entry> = Vec::new();
+    for pr in prs {
+        let view = model.pr_views.get(&pr.pr.url());
+        let (held, rest): (Vec<&Commit>, Vec<&Commit>) = loose.into_iter().partition(|c| view.is_some_and(|v| v.holds(&c.hash)));
+        loose = rest;
+        let time = held.iter().map(|c| c.time).chain(view.and_then(|v| v.updated)).max();
+        entries.push(Entry::Pr { pr, time });
+    }
+    entries.extend(loose.into_iter().map(Entry::Commit));
+    // Stable: among equals (PRs without a time), the newer number stays first.
+    entries.sort_by_key(|e| std::cmp::Reverse(e.time()));
+    entries
+}
+
+fn earlier(indent: &str, more: usize) -> String {
+    format!("{indent}  … {more} earlier commit{}", if more == 1 { "" } else { "s" })
+}
+
+/// A pull request row and, when expanded, its commits (the merge commit included), newest
+/// first, [`COMMITS_SHOWN`] at most.
 fn push_pr(
     lines: &mut Vec<Line>,
     clicks: &mut HashMap<usize, Click>,
     menus: &mut HashMap<usize, Target>,
     model: &Model,
     pr: &PrRecord,
-    commits: Option<(&Path, &[&Commit])>,
     cols: usize,
 ) {
     let url = pr.pr.url();
     let expanded = model.expanded.contains(&url);
     clicks.insert(lines.len(), Click::Pr { url: url.clone() });
     menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
-    lines.push(pr_line(pr, model.pr_errors.get(&url), expanded, cols));
-    if let Some((root, commits)) = commits {
-        push_commits(lines, clicks, "   ", root, commits, cols);
-    }
+    let title = model.pr_views.get(&url).map(|v| v.title.as_str());
+    lines.push(pr_line(pr, title, model.pr_errors.get(&url), expanded, cols));
     if !expanded {
         return;
     }
-    match model.pr_files.get(&url) {
-        None => lines.push(vec![("    …".into(), Tone::Dim)]),
-        Some(Err(e)) => lines.push(vec![(fit_end(&format!("    ! {e}"), cols), Tone::Error)]),
+    let Some(view) = model.pr_views.get(&url) else {
+        lines.push(vec![("    …".into(), Tone::Dim)]);
+        return;
+    };
+    let chat: Vec<&Commit> = pr.root.as_ref().and_then(|root| model.commits.get(root)).into_iter().flatten().collect();
+    let mut commits: Vec<&PrCommit> = view.merge.iter().chain(&view.commits).collect();
+    commits.sort_by_key(|c| std::cmp::Reverse(c.time));
+    for commit in commits.iter().take(COMMITS_SHOWN) {
+        let mine = chat.iter().find(|c| c.hash == commit.oid);
+        // GitHub names no subject for the merge commit; the checkout may know it.
+        let subject = commit.subject.as_deref().or(mine.map(|c| c.subject.as_str())).unwrap_or("merge commit");
+        let at = CommitAt { hash: commit.oid.clone(), root: pr.root.clone(), repo: Some(pr.pr.slug()) };
+        let row = CommitLine { at, under: Some(url.clone()), subject, chat: mine.is_some() };
+        push_commit(lines, clicks, model, row, "   ", cols);
+    }
+    if commits.len() > COMMITS_SHOWN {
+        lines.push(vec![(fit_end(&earlier("   ", commits.len() - COMMITS_SHOWN), cols), Tone::Dim)]);
+    }
+}
+
+/// A commit as listed: where to read it, the pull request it is listed in, its subject, and
+/// whether the chat made it.
+struct CommitLine<'a> {
+    at: CommitAt,
+    under: Option<String>,
+    subject: &'a str,
+    chat: bool,
+}
+
+/// A commit row and, when expanded, one row per file it changes.
+fn push_commit(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, model: &Model, row: CommitLine, indent: &str, cols: usize) {
+    let expanded = model.expanded.contains(&row.at.hash);
+    clicks.insert(lines.len(), Click::Commit { commit: row.at.clone(), under: row.under.clone() });
+    lines.push(commit_row(indent, &row, expanded, cols));
+    if !expanded {
+        return;
+    }
+    let indent = format!("{indent}   ");
+    match model.commit_files.get(&row.at.hash) {
+        None => lines.push(vec![(format!("{indent}…"), Tone::Dim)]),
+        Some(Err(e)) => lines.push(vec![(fit_end(&format!("{indent}! {e}"), cols), Tone::Error)]),
         Some(Ok(files)) => {
             for file in files {
-                let tone = match file.code() {
+                let tone = match file.code {
                     'A' => Tone::Good,
                     'D' => Tone::Bad,
                     _ => Tone::Waiting,
                 };
-                clicks.insert(lines.len(), Click::PrFile { url: url.clone(), path: file.path.clone() });
-                let stat = LineStat::Lines { added: file.additions, removed: file.deletions };
-                lines.push(file_row("    ", (file.code().to_string(), tone), &file.path, Some(stat), cols));
+                clicks.insert(lines.len(), Click::CommitFile { commit: row.at.clone(), path: file.path.clone() });
+                lines.push(file_row(&indent, (file.code.to_string(), tone), &file.path, Some(file.stat), cols));
             }
         }
     }
 }
 
-/// `<indent>● 225ac66 merge the feature…`: a commit the chat made, its subject cut to fit.
-fn commit_row(indent: &str, commit: &Commit, cols: usize) -> Line {
-    let prefix = format!("{indent}● {} ", commit.short);
-    let subject = fit_end(&commit.subject, cols.saturating_sub(prefix.width()));
+/// `<indent>▸ 225ac66 merge the feature…`: expand marker (green for the chat's own commits),
+/// short hash, subject cut to fit (dim for commits the chat did not make).
+fn commit_row(indent: &str, row: &CommitLine, expanded: bool, cols: usize) -> Line {
+    let short: String = row.at.hash.chars().take(7).collect();
+    let prefix = format!("{indent}▸ {short} ");
+    let subject = fit_end(row.subject, cols.saturating_sub(prefix.width()));
+    let (marker, text) = if row.chat { (Tone::Good, Tone::Plain) } else { (Tone::Dim, Tone::Dim) };
     vec![
         (indent.to_string(), Tone::Plain),
-        ("●".into(), Tone::Good),
+        ((if expanded { "▾" } else { "▸" }).into(), marker),
         (" ".into(), Tone::Plain),
-        (commit.short.clone(), Tone::Dim),
+        (short, Tone::Dim),
         (" ".into(), Tone::Plain),
-        (subject, Tone::Plain),
+        (subject, text),
     ]
 }
 
@@ -290,9 +376,9 @@ fn file_row(indent: &str, (code, tone): (String, Tone), path: &str, stat: Option
     line
 }
 
-/// ` ▸ #121 open ✓`: expand marker, number (a link to the PR), state, CI rollup (omitted when
-/// the PR has no checks).
-fn pr_line(pr: &PrRecord, error: Option<&String>, expanded: bool, cols: usize) -> Line {
+/// ` ▸ #121 open ✓ fix the login`: expand marker, number (a link to the PR), state, CI rollup
+/// (omitted when the PR has no checks), title cut to fit.
+fn pr_line(pr: &PrRecord, title: Option<&str>, error: Option<&String>, expanded: bool, cols: usize) -> Line {
     let number = format!("#{}", pr.pr.number);
     let room = cols.saturating_sub(number.width() + 4);
     let marker = if expanded { " ▾ " } else { " ▸ " };
@@ -317,6 +403,14 @@ fn pr_line(pr: &PrRecord, error: Option<&String>, expanded: bool, cols: usize) -
         }
         (None, Some(err)) => line.push((format!(" {}", fit_end(&format!("! {err}"), room)), Tone::Error)),
         (None, None) => line.push((" …".into(), Tone::Dim)),
+    }
+    if let Some(title) = title.filter(|_| pr.status.is_some()) {
+        // The link escapes take no columns: count the number itself.
+        let used = marker.width() + number.width() + line[2..].iter().map(|(t, _)| t.width()).sum::<usize>();
+        let room = cols.saturating_sub(used + 1);
+        if room > 0 {
+            line.push((format!(" {}", fit_end(title, room)), Tone::Plain));
+        }
     }
     line
 }
@@ -482,6 +576,49 @@ fn fit_start(s: &str, max: usize) -> String {
     let mut out = String::from(if max > 0 { "…" } else { "" });
     out.extend(tail.into_iter().rev());
     out
+}
+
+/// The screen column of a row's expand marker (`▸`/`▾`), if it has one. It precedes any link
+/// escapes on the row, so plain character widths count.
+pub(super) fn marker_column(line: &Line) -> Option<usize> {
+    let mut col = 0;
+    for c in line.iter().flat_map(|(text, _)| text.chars()) {
+        if matches!(c, '▸' | '▾') {
+            return Some(col);
+        }
+        col += c.width().unwrap_or(0);
+    }
+    None
+}
+
+/// The part of a row a click lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Zone {
+    /// The expand marker, give or take a column.
+    Marker,
+    /// A pull request's number and status, up to its title.
+    Link,
+    /// Anything else.
+    Body,
+}
+
+pub(super) fn zone(line: &Line, col: usize) -> Zone {
+    if marker_column(line).is_some_and(|m| col.abs_diff(m) <= 1) {
+        return Zone::Marker;
+    }
+    let (mut at, mut link, mut title) = (0, None, None);
+    for (text, tone) in line {
+        match tone {
+            Tone::Link if link.is_none() => link = Some(at),
+            Tone::Plain if link.is_some() && title.is_none() => title = Some(at),
+            _ => {}
+        }
+        at += crate::ansi::width(text);
+    }
+    match link {
+        Some(start) if col >= start && col < title.unwrap_or(usize::MAX) => Zone::Link,
+        _ => Zone::Body,
+    }
 }
 
 /// Draws the view; the link or pull request under the pointer (`hover`, see [`View::url_at`])
