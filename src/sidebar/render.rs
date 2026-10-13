@@ -376,10 +376,10 @@ fn file_row(indent: &str, (code, tone): (String, Tone), path: &str, stat: Option
     line
 }
 
-/// ` ▸ #121 open ✓ fix the login`: expand marker, number (a link to the PR), state, CI rollup
-/// (omitted when the PR has no checks), title cut to fit.
+/// ` ▸ PR#121 open ✓ fix the login`: expand marker, number (a link to the PR), state, CI
+/// rollup (omitted when the PR has no checks), title cut to fit.
 fn pr_line(pr: &PrRecord, title: Option<&str>, error: Option<&String>, expanded: bool, cols: usize) -> Line {
-    let number = format!("#{}", pr.pr.number);
+    let number = format!("PR#{}", pr.pr.number);
     let room = cols.saturating_sub(number.width() + 4);
     let marker = if expanded { " ▾ " } else { " ▸ " };
     let mut line = vec![(marker.into(), Tone::Dim), (hyperlink(&pr.pr.url(), &number), Tone::Link)];

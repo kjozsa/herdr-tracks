@@ -5,6 +5,7 @@ use crate::state::DockGuard;
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// herdr's defaults for `[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`.
 const DEFAULT_WIDTH: u32 = 26;
@@ -225,7 +226,10 @@ fn dock_target(layout: &Layout) -> Result<String> {
 
 /// (columns of the right split containing `pane`, columns of `pane`, split ratio).
 fn split_widths(pane: &str) -> Result<(u32, u32, f64)> {
-    let layout = herdr::pane_layout(pane)?;
+    widths_in(&herdr::pane_layout(pane)?, pane)
+}
+
+fn widths_in(layout: &Layout, pane: &str) -> Result<(u32, u32, f64)> {
     let me = layout
         .panes
         .iter()
@@ -241,10 +245,61 @@ fn split_widths(pane: &str) -> Result<(u32, u32, f64)> {
     Ok((split.rect.width, me.rect.width, split.ratio))
 }
 
-/// Re-snaps a docked sidebar to the configured width, e.g. after a neighbouring pane closed
-/// and herdr handed it that pane's columns.
-pub fn hold_width(pane: &str) -> Result<()> {
-    snap_width(pane, sidebar_width())
+/// What a docked sidebar remembers to keep its width: the width the user dragged it to, the
+/// tab's panes and split width when it last resized, and when the sidebar started.
+#[derive(Debug, Default)]
+pub struct WidthHold {
+    dragged: Option<u32>,
+    shape: Option<(Vec<String>, u32)>,
+    started: Option<Instant>,
+}
+
+/// Resizes this soon after a sidebar starts are docking still going on, not drags.
+const SETTLE: Duration = Duration::from_secs(2);
+
+impl WidthHold {
+    /// Takes note of a resize to `width` columns in a tab of `shape`. Same panes and split
+    /// width as last time: the user dragged the edge, and that width is kept. Otherwise a
+    /// neighbour opened or closed, or the window changed size: returns the width to snap back
+    /// to, the dragged one or else `configured`. While `settling` (docking), always snaps.
+    fn after_resize(&mut self, shape: (Vec<String>, u32), width: u32, configured: u32, settling: bool) -> Option<u32> {
+        let dragged = !settling && self.shape.as_ref() == Some(&shape);
+        self.shape = Some(shape);
+        if dragged {
+            self.dragged = Some(width);
+            return None;
+        }
+        Some(self.dragged.unwrap_or(configured))
+    }
+}
+
+/// The tab's panes and the split width around `pane`, and `pane`'s own width.
+fn shape(pane: &str) -> Result<((Vec<String>, u32), u32)> {
+    let layout = herdr::pane_layout(pane)?;
+    let (total, width, _) = widths_in(&layout, pane)?;
+    let mut panes: Vec<String> = layout.panes.iter().map(|p| p.pane_id.clone()).collect();
+    panes.sort();
+    Ok(((panes, total), width))
+}
+
+/// Notes the tab as it is when the sidebar starts, so that its first drag is told from a
+/// layout change.
+pub fn watch_width(pane: &str, hold: &mut WidthHold) -> Result<()> {
+    hold.started = Some(Instant::now());
+    hold.shape = Some(shape(pane)?.0);
+    Ok(())
+}
+
+/// After a docked sidebar's size changed: keeps a width the user dragged it to, and snaps back
+/// to it (or the configured width) when herdr handed the sidebar other columns, e.g. a closed
+/// neighbour's.
+pub fn hold_width(pane: &str, hold: &mut WidthHold) -> Result<()> {
+    let (tab, width) = shape(pane)?;
+    let settling = hold.started.is_some_and(|at| at.elapsed() < SETTLE);
+    match hold.after_resize(tab, width, sidebar_width(), settling) {
+        Some(want) => snap_width(pane, want),
+        None => Ok(()),
+    }
 }
 
 /// Resizes the right-hand `pane` to `width` columns. herdr gives the left side
@@ -362,5 +417,18 @@ mod tests {
         ];
         let ids: Vec<&str> = orphans(&panes).iter().map(|p| p.pane_id.as_str()).collect();
         assert_eq!(ids, ["a1", "a2"]);
+    }
+
+    #[test]
+    fn a_drag_sets_the_width_and_layout_changes_snap_back_to_it() {
+        let tab = |panes: &[&str], total| (panes.iter().map(|p| p.to_string()).collect::<Vec<_>>(), total);
+        let mut hold = WidthHold::default();
+        // While docking settles, resizes in an unchanged tab still snap to the configured width.
+        assert_eq!(hold.after_resize(tab(&["a", "s"], 200), 80, 50, true), Some(50), "docking");
+        assert_eq!(hold.after_resize(tab(&["a", "s"], 200), 75, 50, true), Some(50), "docking, same tab");
+        assert_eq!(hold.after_resize(tab(&["a", "s"], 200), 50, 50, false), None, "the snap's own resize");
+        assert_eq!(hold.after_resize(tab(&["a", "s"], 200), 72, 50, false), None, "dragged to 72");
+        assert_eq!(hold.after_resize(tab(&["a", "b", "s"], 200), 61, 50, false), Some(72), "a pane opened");
+        assert_eq!(hold.after_resize(tab(&["a", "b", "s"], 240), 88, 50, false), Some(72), "the window grew");
     }
 }

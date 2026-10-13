@@ -90,6 +90,8 @@ struct Model {
     /// Whether the selection was made with the keys: only then is it drawn highlighted (and
     /// kept in view). A clicked row needs no marking.
     keyboard: bool,
+    /// The width to keep: a dragged one, or herdr's left-sidebar width.
+    width: crate::dock::WidthHold,
 }
 
 impl Model {
@@ -221,6 +223,8 @@ struct Due {
 /// Runs for the pane's lifetime. There is no quit key: the sidebar is mandatory.
 fn event_loop(me: &str) -> Result<()> {
     let mut model = Model { me: me.to_string(), ..Model::default() };
+    let watched = crate::dock::watch_width(me, &mut model.width);
+    model.note(watched);
     let mut shown: (Vec<Line>, Option<usize>, Option<String>) = (Vec::new(), None, None);
     let now = Instant::now();
     let mut due = Due { sample: now, git: now, pr: now };
@@ -346,7 +350,7 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
         }
         (menu, Event::Resize(..)) => {
             model.menu = menu;
-            crate::dock::hold_width(&model.me)
+            crate::dock::hold_width(&model.me, &mut model.width)
         }
         // The wheel over the links block scrolls it (and closes a menu anchored to its rows).
         (_, Event::Mouse(MouseEvent { kind: kind @ (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp), row, .. }))
@@ -662,11 +666,11 @@ mod tests {
         let pr_row = screen.rows().iter().find(|(_, c)| c.key() == Key::Pr(pr(5).url())).unwrap().0;
         let row: String = screen.lines[pr_row].iter().map(|(t, _)| crate::ansi::fit(t, 99)).collect();
         assert_eq!(crate::ansi::width(&row), 40);
-        assert!(row.ends_with("#5\x1b]8;;\x1b\\ open lodge every beneficial owner…"), "{row:?}");
-        // ` ▸ #5 open lodge…`: the marker expands, number and status open the browser, the title
-        // shows the diff.
+        assert!(row.ends_with("PR#5\x1b]8;;\x1b\\ open lodge every beneficial own…"), "{row:?}");
+        // ` ▸ PR#5 open lodge…`: the marker expands, number and status open the browser, the
+        // title shows the diff.
         let zone = |col| render::zone(&screen.lines[pr_row], col);
-        assert_eq!([1, 3, 9, 12].map(zone), [render::Zone::Marker, render::Zone::Link, render::Zone::Link, render::Zone::Body]);
+        assert_eq!([1, 3, 9, 14].map(zone), [render::Zone::Marker, render::Zone::Link, render::Zone::Link, render::Zone::Body]);
 
         // Expanded, the PR lists all its commits, newest first: the chat's own marked green,
         // others dim; and an expanded commit lists its files, each with its diff in the commit.
