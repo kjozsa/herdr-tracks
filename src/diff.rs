@@ -86,11 +86,16 @@ pub fn run() -> Result<()> {
 type PrPatches = HashMap<String, (Instant, Result<String, String>)>;
 
 /// Shows the requested diff until `q`/`Esc`, re-rendering when the request or width changes.
-/// Also ends once `owner` (the sidebar pane) is gone: nothing would point the viewer anywhere.
+/// `w` wraps long lines, or cuts them at the edge again. Also ends once `owner` (the sidebar
+/// pane) is gone: nothing would point the viewer anywhere.
 fn view(file: &Path, owner: Option<&str>) -> Result<()> {
     let mut request_text = String::new();
     let mut rendered: Option<(String, u16)> = None;
     let mut lines: Vec<String> = Vec::new();
+    let mut wrap = false;
+    // The rows on screen (`lines`, wrapped or not) and, per row, its line in `lines`.
+    let mut shown: Vec<String> = Vec::new();
+    let mut origin: Vec<usize> = Vec::new();
     let mut patches = PrPatches::new();
     let mut scroll = 0usize;
     let mut dirty = true;
@@ -108,12 +113,14 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
                 Err(_) => vec!["waiting for a file…".into()],
             };
             rendered = Some((request_text.clone(), cols));
+            (shown, origin) = layout(&lines, wrap, cols);
             dirty = true;
         }
-        let page = usize::from(rows);
-        scroll = scroll.min(lines.len().saturating_sub(page));
+        // The last row holds the key hint; the diff scrolls above it.
+        let page = usize::from(rows.saturating_sub(1)).max(1);
+        scroll = scroll.min(shown.len().saturating_sub(page));
         if dirty {
-            draw(&lines[scroll..], cols, rows)?;
+            draw(&shown[scroll..], cols, rows, if wrap { "w unwrap · q close" } else { "w wrap · q close" })?;
             dirty = false;
         }
         if !event::poll(POLL)? {
@@ -135,6 +142,13 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
                 KeyCode::PageUp | KeyCode::Char('b') => scroll = scroll.saturating_sub(page),
                 KeyCode::Home | KeyCode::Char('g') => scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => scroll = usize::MAX,
+                KeyCode::Char('w') => {
+                    // Keep the line at the top of the screen there.
+                    let top = origin.get(scroll).copied().unwrap_or(0);
+                    wrap = !wrap;
+                    (shown, origin) = layout(&lines, wrap, cols);
+                    scroll = origin.iter().position(|&line| line == top).unwrap_or(0);
+                }
                 _ => dirty = false,
             },
             Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }) => scroll += WHEEL_LINES,
@@ -144,6 +158,23 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
             _ => {}
         }
     }
+}
+
+/// The rows to show: each line whole (cut at the edge when drawn), or wrapped at `cols`; with
+/// the index of the line each row comes from.
+fn layout(lines: &[String], wrap: bool, cols: u16) -> (Vec<String>, Vec<usize>) {
+    if !wrap {
+        return (lines.to_vec(), (0..lines.len()).collect());
+    }
+    let mut shown = Vec::with_capacity(lines.len());
+    let mut origin = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        for piece in ansi::wrap(line, usize::from(cols)) {
+            shown.push(piece);
+            origin.push(i);
+        }
+    }
+    (shown, origin)
 }
 
 /// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
@@ -274,14 +305,25 @@ fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
     args
 }
 
-fn draw(lines: &[String], cols: u16, rows: u16) -> Result<()> {
+/// Draws `lines` from the top and `hint`, dimmed and right-aligned, on the last row.
+fn draw(lines: &[String], cols: u16, rows: u16, hint: &str) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    for row in 0..rows {
+    let body = if rows > 1 { rows - 1 } else { rows };
+    for row in 0..body {
         queue!(out, cursor::MoveTo(0, row))?;
-        if let Some(line) = lines.get(usize::from(row)) {
-            queue!(out, Print(ansi::fit(line, usize::from(cols))))?;
+        let line = lines.get(usize::from(row)).map(|line| ansi::fit(line, usize::from(cols))).unwrap_or_default();
+        queue!(out, Print(&line), Print("\x1b[0m"))?;
+        // Not on full rows: after the last column the cursor waits to wrap, and an erase there
+        // wipes that last cell.
+        if ansi::width(&line) < usize::from(cols) {
+            queue!(out, terminal::Clear(terminal::ClearType::UntilNewLine))?;
         }
-        queue!(out, Print("\x1b[0m"), terminal::Clear(terminal::ClearType::UntilNewLine))?;
+    }
+    if body < rows {
+        let hint = ansi::fit(hint, usize::from(cols).saturating_sub(1));
+        let pad = usize::from(cols).saturating_sub(ansi::width(&hint) + 1);
+        queue!(out, cursor::MoveTo(0, body), terminal::Clear(terminal::ClearType::CurrentLine))?;
+        queue!(out, cursor::MoveTo(pad as u16, body), Print(format!("\x1b[2m{hint}\x1b[0m")))?;
     }
     out.flush()?;
     Ok(())

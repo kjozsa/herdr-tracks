@@ -80,7 +80,8 @@ In the sidebar:
 | `Enter` | Move focus into the diff to scroll it |
 | `Esc` | Close the diff |
 
-In the diff pane: `↓` `↑`, PgDn/PgUp, space/`b`, `g`/`G`, mouse wheel; `q` or `Esc` closes it.
+In the diff pane: `↓` `↑`, PgDn/PgUp, space/`b`, `g`/`G`, mouse wheel; `w` wraps long lines (again
+to cut them at the edge); `q` or `Esc` closes it.
 Diffs are formatted with [delta](https://github.com/dandavison/delta) when it is your git pager.
 
 A dismissed repo returns when the chat touches it again, a dismissed link when the chat

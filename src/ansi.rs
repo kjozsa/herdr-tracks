@@ -62,6 +62,44 @@ pub fn fit(line: &str, cols: usize) -> String {
     out
 }
 
+/// Splits the text into pieces of at most `cols` display columns. Each piece after the first
+/// starts with the colours (SGR) and hyperlink still open where the previous one ended, so a
+/// wrapped line keeps its look.
+pub fn wrap(line: &str, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut used = 0;
+    // Escapes in effect: SGR since the last reset, and an open OSC 8 link.
+    let mut sgr = String::new();
+    let mut link: Option<&str> = None;
+    for (segment, visible) in segments(line) {
+        if visible {
+            let w = segment.chars().next().and_then(|c| c.width()).unwrap_or(0);
+            if used + w > cols && used > 0 {
+                pieces.push(std::mem::take(&mut piece));
+                piece.push_str(&sgr);
+                piece.extend(link);
+                used = 0;
+            }
+            used += w;
+        } else if let Some(params) = segment.strip_prefix("\x1b[").and_then(|s| s.strip_suffix('m')) {
+            if params.is_empty() || params == "0" {
+                sgr.clear();
+            } else {
+                sgr.push_str(segment);
+            }
+        } else if let Some(osc) = segment.strip_prefix("\x1b]8;") {
+            // `ESC ] 8 ; params ; URI ST`: an empty URI closes the link.
+            let uri = osc.split_once(';').map_or("", |(_, rest)| rest.trim_end_matches(['\x07', '\\']).trim_end_matches('\x1b'));
+            link = (!uri.is_empty()).then_some(segment);
+        }
+        piece.push_str(segment);
+    }
+    pieces.push(piece);
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +114,16 @@ mod tests {
         assert_eq!(fit(link, 2), "\x1b]8;;https://x\x1b\\#1");
         assert_eq!(width(&format!("{red}日本\x1b[0m")), 4);
         assert_eq!(fit("short", 80), "short");
+    }
+
+    #[test]
+    fn wrapped_pieces_carry_on_the_open_colours_and_link() {
+        let red = "\x1b[31m";
+        let bg = "\x1b[48;5;52m";
+        assert_eq!(wrap(&format!("{red}{bg}abcde\x1b[0mfg"), 2), [format!("{red}{bg}ab"), format!("{red}{bg}cd"), format!("{red}{bg}e\x1b[0mf"), "g".to_string()]);
+        assert_eq!(wrap("日本語", 3), ["日", "本", "語"], "a wide character that does not fit moves on");
+        let open = "\x1b]8;;https://x\x1b\\";
+        assert_eq!(wrap(&format!("{open}abc\x1b]8;;\x1b\\d"), 2), [format!("{open}ab"), format!("{open}c\x1b]8;;\x1b\\d")]);
+        assert_eq!(wrap("", 4), [""]);
     }
 }
