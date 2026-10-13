@@ -9,7 +9,7 @@ mod collect;
 mod render;
 
 use crate::diff::{self, DiffRequest};
-use crate::git::{Change, RepoStatus};
+use crate::git::{Change, Commit, RepoStatus};
 use crate::github::{self, PrFile, PrRef};
 use crate::herdr;
 use crate::state::{self, DismissedLink, DismissedRepo, SessionRepos};
@@ -41,12 +41,23 @@ struct Session {
     transcript: Option<Transcript>,
     /// Web links the chat mentioned, newest first; rebuilt from the transcript on start.
     links: Vec<String>,
+    /// The chat's finished tool calls, as (start, end) unix milliseconds; rebuilt from the
+    /// transcript on start. Commits made within them are the chat's.
+    calls: Vec<(i64, i64)>,
 }
+
+/// `git status` of each shown repo.
+type Statuses = HashMap<PathBuf, Result<RepoStatus, String>>;
 
 #[derive(Default)]
 struct Model {
     session: Option<Session>,
-    statuses: HashMap<PathBuf, Result<RepoStatus, String>>,
+    statuses: Statuses,
+    /// Commits the chat made, per repo, newest first.
+    commits: HashMap<PathBuf, Vec<Commit>>,
+    /// Hashes of each pull request's commits and merge commit, by URL: the chat's commits
+    /// among them are listed under the pull request.
+    pr_commits: HashMap<String, Vec<String>>,
     error: Option<String>,
     /// github.com `owner/repo` slugs of each checkout's remotes.
     remotes: HashMap<PathBuf, Vec<String>>,
@@ -100,6 +111,8 @@ enum Click {
     PrFile { url: String, path: String },
     /// A file changed by commits not yet pushed.
     Unpushed { root: PathBuf, path: String },
+    /// A commit the chat made.
+    Commit { root: PathBuf, hash: String },
 }
 
 /// Identity of a selectable row that survives refreshes (a file's status code may change).
@@ -109,6 +122,7 @@ enum Key {
     Pr(String),
     PrFile(String, String),
     Unpushed(PathBuf, String),
+    Commit(PathBuf, String),
 }
 
 impl Click {
@@ -118,6 +132,7 @@ impl Click {
             Click::Pr { url } => Key::Pr(url.clone()),
             Click::PrFile { url, path } => Key::PrFile(url.clone(), path.clone()),
             Click::Unpushed { root, path } => Key::Unpushed(root.clone(), path.clone()),
+            Click::Commit { root, hash } => Key::Commit(root.clone(), hash.clone()),
         }
     }
 
@@ -127,6 +142,7 @@ impl Click {
             Click::Pr { url } => DiffRequest::Pr { url: url.clone(), path: None },
             Click::PrFile { url, path } => DiffRequest::Pr { url: url.clone(), path: Some(path.clone()) },
             Click::Unpushed { root, path } => DiffRequest::Unpushed { root: root.clone(), path: path.clone() },
+            Click::Commit { root, hash } => DiffRequest::Commit { root: root.clone(), hash: hash.clone() },
         }
     }
 }
@@ -243,7 +259,7 @@ fn refresh(model: &mut Model, due: &mut Due) {
     }
     if now >= due.git {
         due.git = now + GIT_EVERY;
-        model.statuses = collect::refresh_git(model);
+        (model.statuses, model.commits) = collect::refresh_git(model);
         let result = collect::track_changes(model);
         model.note(result);
     }
@@ -534,13 +550,56 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            calls: Vec::new(),
             links: Vec::new(),
         });
         let screen = render(&model, 40);
         let rows: Vec<Key> = screen.rows().into_iter().map(|(_, c)| c.key()).collect();
         assert_eq!(rows, [Key::File(root.clone(), "a.py".into()), Key::Unpushed(root.clone(), "e2e/b.py".into())]);
         let unpushed = screen.rows()[1].1.diff_request();
-        assert_eq!(unpushed, DiffRequest::Unpushed { root, path: "e2e/b.py".into() });
+        assert_eq!(unpushed, DiffRequest::Unpushed { root: root.clone(), path: "e2e/b.py".into() });
+
+        // The chat's commits follow, newest first, ten at most; one more row counts the rest.
+        let commit = |n: i64| Commit { hash: format!("h{n}"), short: format!("s{n}"), time: n, subject: format!("commit {n}") };
+        model.commits.insert(root.clone(), (0..12).rev().map(commit).collect());
+        let screen = render(&model, 40);
+        let rows: Vec<Key> = screen.rows().into_iter().skip(2).map(|(_, c)| c.key()).collect();
+        assert_eq!(rows, (2..12).rev().map(|n| Key::Commit(root.clone(), format!("h{n}"))).collect::<Vec<_>>());
+        let text = |line: &render::Line| line.iter().map(|(t, _)| t.as_str()).collect::<String>();
+        let last = screen.lines.len() - 1;
+        assert_eq!(text(&screen.lines[last - 1]), " ● s2 commit 2");
+        assert_eq!(text(&screen.lines[last]), "   … 2 earlier commits");
+        let request = screen.rows()[2].1.diff_request();
+        assert_eq!(request, DiffRequest::Commit { root: root.clone(), hash: "h11".into() });
+
+        // Commits a pull request holds move under it, ahead of the uncommitted files.
+        let pr = PrRef { owner: "o".into(), repo: "e2e".into(), number: 5 };
+        model.pr_commits.insert(pr.url(), vec!["h11".into(), "h3".into(), "elsewhere".into()]);
+        let repos = &mut model.session.as_mut().unwrap().repos;
+        repos.prs.push(PrRecord { pr: pr.clone(), root: Some(root.clone()), status: None });
+        let screen = render(&model, 40);
+        let keys: Vec<Key> = screen.rows().into_iter().map(|(_, c)| c.key()).collect();
+        assert_eq!(keys[..4], [Key::Pr(pr.url()), Key::Commit(root.clone(), "h11".into()), Key::Commit(root.clone(), "h3".into()), Key::File(root.clone(), "a.py".into())]);
+        let pr_row = screen.rows()[0].0;
+        assert_eq!(text(&screen.lines[pr_row + 1]), "   ● s11 commit 11");
+        let repo_level: Vec<Key> = keys[5..].to_vec();
+        assert_eq!(repo_level.len(), 10, "the other ten stay at repo level, all shown");
+        assert!(!repo_level.contains(&Key::Commit(root.clone(), "h3".into())));
+        assert_eq!(text(&screen.lines[screen.lines.len() - 1]), " ● s0 commit 0");
+    }
+
+    #[test]
+    fn calls_merge_into_windows_and_running_ones_end_now() {
+        let session = Session {
+            pane_id: "w:p1".into(),
+            title: String::new(),
+            repos: SessionRepos::default(),
+            persisted: false,
+            transcript: None,
+            calls: vec![(50, 60), (10, 20), (15, 30)],
+            links: Vec::new(),
+        };
+        assert_eq!(collect::call_windows(&session, 100), [(10, 30), (50, 60)]);
     }
 
     #[test]
@@ -556,6 +615,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            calls: Vec::new(),
             links: vec![
                 "https://www.new.io/a".into(),
                 format!("{}/files", pr.url()),
@@ -647,6 +707,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            calls: Vec::new(),
             links: Vec::new(),
         });
         let screen = render(&model, 40);
@@ -693,6 +754,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            calls: Vec::new(),
             links: Vec::new(),
         });
         // Rows: 0 mine, 1 blank, 2 e2e, 3 #36, 4 blank, 5 o/infra, 6 #133.
@@ -746,6 +808,7 @@ mod tests {
             },
             persisted: false,
             transcript: None,
+            calls: Vec::new(),
             links: Vec::new(),
         });
         // Rows: 0 title, 1 blank, 2 repo header, 3 PR, 4 a.rs, 5 b.rs.

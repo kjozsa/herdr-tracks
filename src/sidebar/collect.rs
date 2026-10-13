@@ -1,9 +1,9 @@
 //! Gathering what the sidebar shows: the followed chat, the repos and pull requests it
 //! touched, their git status, and pull-request status from GitHub.
 
-use super::{Model, Session};
-use crate::git::{self, RepoStatus};
-use crate::github::{self, PrRef, PrStatus};
+use super::{Model, Session, Statuses};
+use crate::git::{self, Commit};
+use crate::github::{self, PrRef, PrView};
 use crate::herdr::{self, PaneInfo};
 use crate::repos;
 use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
@@ -13,14 +13,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
-/// Pull-request statuses fetched in the background for one chat.
+/// Pull-request statuses and commits fetched in the background for one chat.
 pub(super) struct PrBatch {
     session: String,
-    results: Vec<(PrRef, Result<PrStatus, String>)>,
+    results: Vec<(PrRef, Result<PrView, String>)>,
 }
 
 /// How many of a chat's most recent links are kept.
 const LINKS_KEPT: usize = 50;
+/// A tool call still running after this long is taken to have died with its agent: commits
+/// later than that are not counted as the chat's.
+const CALL_MAX_MS: i64 = 2 * 60 * 60 * 1000;
 
 /// Picks the followed agent pane and records repos under its processes' working dirs.
 /// Returns whether the repo list changed.
@@ -67,7 +70,15 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
                 .and_then(Format::of_agent)
                 .zip(target.agent_session.as_ref())
                 .map(|(format, s)| Transcript::new(format, s.value.clone(), fallback_cwd));
-            slot.insert(Session { pane_id: target.pane_id.clone(), title, repos, persisted, transcript, links: Vec::new() })
+            slot.insert(Session {
+                pane_id: target.pane_id.clone(),
+                title,
+                repos,
+                persisted,
+                transcript,
+                links: Vec::new(),
+                calls: Vec::new(),
+            })
         }
     };
 
@@ -93,6 +104,7 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
         session.links.insert(0, url);
     }
     session.links.truncate(LINKS_KEPT);
+    session.calls.extend(activity.calls);
     for touch in touches {
         let Some(root) = repos::repo_root(&touch.path) else { continue };
         // A tool call after the dismissal brings a dismissed repo back; the agent merely
@@ -159,17 +171,20 @@ pub(super) fn visible_prs(repos: &SessionRepos) -> impl Iterator<Item = &PrRecor
 
 pub(super) fn has_unfetched_pr(model: &Model) -> bool {
     model.session.as_ref().is_some_and(|s| {
-        visible_prs(&s.repos).any(|p| p.status.is_none() && !model.pr_errors.contains_key(&p.pr.url()))
+        visible_prs(&s.repos).any(|p| needs_fetch(model, p) && !model.pr_errors.contains_key(&p.pr.url()))
     })
 }
 
-/// Fetches every non-final PR's status on a background thread.
+/// Open PRs change; any PR's commits are fetched once per sidebar (they are not persisted).
+fn needs_fetch(model: &Model, pr: &PrRecord) -> bool {
+    !pr.status.is_some_and(|s| s.state.is_final()) || !model.pr_commits.contains_key(&pr.pr.url())
+}
+
+/// Fetches the status and commits of every PR in need (see [`needs_fetch`]) on a background
+/// thread.
 pub(super) fn start_pr_refresh(model: &Model) -> Option<Receiver<PrBatch>> {
     let session = model.session.as_ref()?;
-    let todo: Vec<PrRef> = visible_prs(&session.repos)
-        .filter(|p| !p.status.is_some_and(|s| s.state.is_final()))
-        .map(|p| p.pr.clone())
-        .collect();
+    let todo: Vec<PrRef> = visible_prs(&session.repos).filter(|p| needs_fetch(model, p)).map(|p| p.pr.clone()).collect();
     if todo.is_empty() {
         return None;
     }
@@ -177,7 +192,7 @@ pub(super) fn start_pr_refresh(model: &Model) -> Option<Receiver<PrBatch>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let results = std::thread::scope(|scope| {
-            let jobs: Vec<_> = todo.iter().map(|pr| scope.spawn(move || github::pr_status(pr))).collect();
+            let jobs: Vec<_> = todo.iter().map(|pr| scope.spawn(move || github::pr_view(pr))).collect();
             todo.iter()
                 .cloned()
                 .zip(jobs)
@@ -194,8 +209,9 @@ pub(super) fn apply_prs(model: &mut Model, batch: PrBatch) -> Result<()> {
     let mut dirty = false;
     for (pr, result) in batch.results {
         match result {
-            Ok(status) => {
+            Ok(PrView { status, commits }) => {
                 model.pr_errors.remove(&pr.url());
+                model.pr_commits.insert(pr.url(), commits);
                 if let Some(record) = session.repos.prs.iter_mut().find(|r| r.pr == pr && r.status != Some(status)) {
                     record.status = Some(status);
                     dirty = true;
@@ -232,8 +248,11 @@ pub(super) fn track_changes(model: &mut Model) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn refresh_git(model: &Model) -> HashMap<PathBuf, Result<RepoStatus, String>> {
-    let Some(session) = &model.session else { return HashMap::new() };
+/// Every shown repo's `git status`, and the commits the chat made in it (see [`call_windows`]).
+pub(super) fn refresh_git(model: &Model) -> (Statuses, HashMap<PathBuf, Vec<Commit>>) {
+    let Some(session) = &model.session else { return Default::default() };
+    let windows = call_windows(session, now_ms());
+    let windows = windows.as_slice();
     std::thread::scope(|scope| {
         // Repos deleted since they were touched stay recorded but are not shown.
         let jobs: Vec<_> = session
@@ -242,10 +261,35 @@ pub(super) fn refresh_git(model: &Model) -> HashMap<PathBuf, Result<RepoStatus, 
             .iter()
             .map(|r| &r.root)
             .filter(|root| root.join(".git").exists())
-            .map(|root| (root.clone(), scope.spawn(move || git::status(root))))
+            .map(|root| (root.clone(), scope.spawn(move || (git::status(root), git::commits_within(root, windows)))))
             .collect();
-        jobs.into_iter()
-            .map(|(root, job)| (root, job.join().unwrap_or_else(|_| Err("git status panicked".into()))))
-            .collect()
+        let mut statuses = HashMap::new();
+        let mut commits = HashMap::new();
+        for (root, job) in jobs {
+            let (status, made) = job.join().unwrap_or_else(|_| (Err("git status panicked".into()), Vec::new()));
+            statuses.insert(root.clone(), status);
+            commits.insert(root, made);
+        }
+        (statuses, commits)
     })
+}
+
+/// When the chat was acting: its tool calls, finished or still running, merged where they
+/// overlap. Unix milliseconds.
+pub(super) fn call_windows(session: &Session, now: i64) -> Vec<(i64, i64)> {
+    let running = session.transcript.iter().flat_map(Transcript::running).map(|start| (start, now.min(start + CALL_MAX_MS)));
+    let mut windows: Vec<(i64, i64)> = session.calls.iter().copied().chain(running).collect();
+    windows.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(windows.len());
+    for (start, end) in windows {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }

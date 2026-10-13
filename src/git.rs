@@ -228,9 +228,68 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// A commit, as listed under its repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub hash: String,
+    pub short: String,
+    /// Committer time, unix seconds.
+    pub time: i64,
+    pub subject: String,
+}
+
+/// Commits on any branch, remote branch or tag (or a detached HEAD) committed within one of
+/// `windows` (unix milliseconds, start and end), newest first. Committer time, not author
+/// time: a rebase or cherry-pick within a window counts, a merged-in older commit does not.
+pub fn commits_within(root: &Path, windows: &[(i64, i64)]) -> Vec<Commit> {
+    let Some(since) = windows.iter().map(|(start, _)| start / 1000 - 1).min() else { return Vec::new() };
+    let out = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%h%x1f%ct%x1f%s"])
+        .arg(format!("--since=@{since}"))
+        .output();
+    match out {
+        Ok(out) if out.status.success() => parse_log(&String::from_utf8_lossy(&out.stdout), windows),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_log(text: &str, windows: &[(i64, i64)]) -> Vec<Commit> {
+    // Git keeps whole seconds: allow one on either side of a window.
+    let within = |time: i64| windows.iter().any(|(start, end)| time * 1000 >= start - 1000 && time * 1000 <= end + 1000);
+    let mut commits: Vec<Commit> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, '\x1f');
+            let (hash, short, time) = (fields.next()?, fields.next()?, fields.next()?.parse().ok()?);
+            Some(Commit { hash: hash.into(), short: short.into(), time, subject: fields.next().unwrap_or_default().into() })
+        })
+        .filter(|c| within(c.time))
+        .collect();
+    commits.sort_by_key(|c| std::cmp::Reverse(c.time));
+    commits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commits_count_only_within_the_chat_s_tool_calls() {
+        let log = [
+            "a1\x1fa1s\x1f1000\x1fmerge the feature",
+            "b2\x1fb2s\x1f400\x1fold commit merged in",
+            "c3\x1fc3s\x1f990\x1ffix: a | b",
+            "d4\x1fd4s\x1f2000\x1fanother chat's commit",
+        ]
+        .join("\n");
+        // Two calls: 989.5–995 s and 999–1000.2 s.
+        let commits = parse_log(&log, &[(989_500, 995_000), (999_000, 1_000_200)]);
+        let shown: Vec<(&str, &str)> = commits.iter().map(|c| (c.short.as_str(), c.subject.as_str())).collect();
+        assert_eq!(shown, [("a1s", "merge the feature"), ("c3s", "fix: a | b")], "newest first, outside windows left out");
+    }
 
     const BASE: &str = "# branch.oid 1111\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -1\n";
 

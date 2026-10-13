@@ -3,7 +3,7 @@
 
 use super::collect::{is_dismissed, visible_prs};
 use super::{Click, Key, Menu, Model, Target};
-use crate::git::{LineStat, RepoStatus};
+use crate::git::{Commit, LineStat, RepoStatus};
 use crate::github::{self, Checks, PrState};
 use crate::state::PrRecord;
 use anyhow::Result;
@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Commits listed per repo; older ones are counted on one more row.
+const COMMITS_SHOWN: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tone {
@@ -154,8 +157,13 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
         }
         menus.insert(lines.len(), Target::Repo(root.clone()));
         lines.push(repo_header(root, model.statuses.get(root), cols));
+        // The commits the chat made here, newest first: those a pull request holds go under it.
+        let mut commits: Vec<&Commit> = model.commits.get(root).into_iter().flatten().collect();
         for pr in prs.iter().filter(|p| p.root.as_ref() == Some(root)) {
-            push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols);
+            let held = model.pr_commits.get(&pr.pr.url()).map_or(&[][..], Vec::as_slice);
+            let (mine, rest): (Vec<&Commit>, Vec<&Commit>) = commits.into_iter().partition(|c| held.contains(&c.hash));
+            commits = rest;
+            push_pr(&mut lines, &mut clicks, &mut menus, model, pr, Some((root, &mine)), cols);
         }
         match model.statuses.get(root) {
             None => {}
@@ -174,6 +182,7 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
                 }
             }
         }
+        push_commits(&mut lines, &mut clicks, " ", root, &commits, cols);
     }
     for pr in orphans {
         if !lines.is_empty() {
@@ -181,18 +190,33 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
         }
         menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
         lines.push(vec![(fit_end(&format!("{}/{}", pr.pr.owner, pr.pr.repo), cols), Tone::Repo)]);
-        push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols);
+        push_pr(&mut lines, &mut clicks, &mut menus, model, pr, None, cols);
     }
     Screen { lines, clicks, menus }
 }
 
-/// A pull request row and, when expanded, one row per file it changes.
+/// Commit rows, newest first, [`COMMITS_SHOWN`] at most; one more row counts the rest.
+fn push_commits(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, indent: &str, root: &Path, commits: &[&Commit], cols: usize) {
+    for commit in commits.iter().take(COMMITS_SHOWN) {
+        clicks.insert(lines.len(), Click::Commit { root: root.to_path_buf(), hash: commit.hash.clone() });
+        lines.push(commit_row(indent, commit, cols));
+    }
+    if commits.len() > COMMITS_SHOWN {
+        let more = commits.len() - COMMITS_SHOWN;
+        let text = format!("{indent}  … {more} earlier commit{}", if more == 1 { "" } else { "s" });
+        lines.push(vec![(fit_end(&text, cols), Tone::Dim)]);
+    }
+}
+
+/// A pull request row, the chat's commits it holds (in the checkout at the path), and, when
+/// expanded, one row per file it changes.
 fn push_pr(
     lines: &mut Vec<Line>,
     clicks: &mut HashMap<usize, Click>,
     menus: &mut HashMap<usize, Target>,
     model: &Model,
     pr: &PrRecord,
+    commits: Option<(&Path, &[&Commit])>,
     cols: usize,
 ) {
     let url = pr.pr.url();
@@ -200,6 +224,9 @@ fn push_pr(
     clicks.insert(lines.len(), Click::Pr { url: url.clone() });
     menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
     lines.push(pr_line(pr, model.pr_errors.get(&url), expanded, cols));
+    if let Some((root, commits)) = commits {
+        push_commits(lines, clicks, "   ", root, commits, cols);
+    }
     if !expanded {
         return;
     }
@@ -219,6 +246,20 @@ fn push_pr(
             }
         }
     }
+}
+
+/// `<indent>● 225ac66 merge the feature…`: a commit the chat made, its subject cut to fit.
+fn commit_row(indent: &str, commit: &Commit, cols: usize) -> Line {
+    let prefix = format!("{indent}● {} ", commit.short);
+    let subject = fit_end(&commit.subject, cols.saturating_sub(prefix.width()));
+    vec![
+        (indent.to_string(), Tone::Plain),
+        ("●".into(), Tone::Good),
+        (" ".into(), Tone::Plain),
+        (commit.short.clone(), Tone::Dim),
+        (" ".into(), Tone::Plain),
+        (subject, Tone::Plain),
+    ]
 }
 
 /// `<indent><code> <path>        +12 -3`: the path is shortened from the left so the line

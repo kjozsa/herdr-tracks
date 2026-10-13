@@ -117,10 +117,21 @@ pub struct PrStatus {
     pub checks: Option<Checks>,
 }
 
-pub fn pr_status(pr: &PrRef) -> Result<PrStatus, String> {
-    let json = gh(&["pr", "view", &pr.url(), "--json", "state,isDraft,statusCheckRollup"])?;
+/// What the sidebar fetches of a pull request.
+#[derive(Debug)]
+pub struct PrView {
+    pub status: PrStatus,
+    /// Hashes of the commits it holds, plus its merge commit (with a squash merge, the only
+    /// one on the base branch).
+    pub commits: Vec<String>,
+}
+
+pub fn pr_view(pr: &PrRef) -> Result<PrView, String> {
+    let json = gh(&["pr", "view", &pr.url(), "--json", "state,isDraft,statusCheckRollup,commits,mergeCommit"])?;
     let json: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
-    Ok(parse_status(&json))
+    let oids = json["commits"].as_array().into_iter().flatten().map(|c| &c["oid"]).chain([&json["mergeCommit"]["oid"]]);
+    let commits = oids.filter_map(|oid| oid.as_str().map(str::to_string)).collect();
+    Ok(PrView { status: parse_status(&json), commits })
 }
 
 fn parse_status(json: &Value) -> PrStatus {

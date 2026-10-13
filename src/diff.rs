@@ -35,6 +35,9 @@ pub enum DiffRequest {
     Local { root: PathBuf, path: String, orig: Option<String>, untracked: bool },
     /// What the unpushed commits change in one file of a local checkout (`@{u}...HEAD`).
     Unpushed { root: PathBuf, path: String },
+    /// One commit of a local checkout: its message and what it changes (a merge: against its
+    /// first parent, i.e. what it brought in).
+    Commit { root: PathBuf, hash: String },
     /// A pull request's patch: one file of it, or all of it.
     Pr { url: String, path: Option<String> },
 }
@@ -146,7 +149,7 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
 /// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
 fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut PrPatches) -> Vec<String> {
     let (patch, repo) = match request {
-        DiffRequest::Local { root, .. } | DiffRequest::Unpushed { root, .. } => {
+        DiffRequest::Local { root, .. } | DiffRequest::Unpushed { root, .. } | DiffRequest::Commit { root, .. } => {
             (local_patch(request, root), Some(root.as_path()))
         }
         DiffRequest::Pr { url, path } => (pr_patch(patches, url, path.as_deref()), None),
@@ -245,8 +248,13 @@ fn colorize(patch: &str) -> String {
 }
 
 /// Local changes: staged and unstaged together (`git diff HEAD`), untracked files as all-new;
-/// unpushed commits: what a push would add (`@{u}...HEAD`).
+/// unpushed commits: what a push would add (`@{u}...HEAD`); a commit: `git show`.
 fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
+    if let DiffRequest::Commit { hash, .. } = request {
+        return ["show", "--color=never", "--format=fuller", "--diff-merges=first-parent", "-M", hash.as_str()]
+            .map(String::from)
+            .to_vec();
+    }
     let mut args: Vec<String> = vec!["diff".into(), "--color=never".into()];
     match request {
         DiffRequest::Local { path, untracked: true, .. } => {
@@ -261,7 +269,7 @@ fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
         DiffRequest::Unpushed { path, .. } => {
             args.extend(["-M", "@{u}...HEAD", "--", path.as_str()].map(String::from));
         }
-        DiffRequest::Pr { .. } => return Vec::new(),
+        DiffRequest::Pr { .. } | DiffRequest::Commit { .. } => return Vec::new(),
     }
     args
 }

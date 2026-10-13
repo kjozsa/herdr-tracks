@@ -4,7 +4,7 @@
 
 use crate::github::{self, PrRef};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -43,6 +43,10 @@ pub struct Transcript {
     cwd: PathBuf,
     /// Ids of `gh pr create` calls whose result has not been read yet.
     pr_calls: HashSet<String>,
+    /// Start (unix milliseconds) of every tool call whose result has not been read yet.
+    running: HashMap<String, i64>,
+    /// Timestamp (unix milliseconds) of the transcript line being scanned.
+    line_ms: Option<i64>,
 }
 
 /// What the agent did in transcript lines appended since the last poll.
@@ -59,6 +63,9 @@ pub struct Activity {
     /// transcript order, each with the position of its mention. Tool output is left out: it
     /// would bury the rest.
     pub links: Vec<(String, u64)>,
+    /// Tool calls that finished, as (start, end) unix milliseconds: whatever the chat did,
+    /// it did within these.
+    pub calls: Vec<(i64, i64)>,
 }
 
 impl Transcript {
@@ -72,12 +79,19 @@ impl Transcript {
             line_end: 0,
             cwd: fallback_cwd,
             pr_calls: HashSet::new(),
+            running: HashMap::new(),
+            line_ms: None,
         }
     }
 
     /// How far the transcript has been read: positions of later touches are greater.
     pub fn position(&self) -> u64 {
         self.offset - self.pending.len() as u64
+    }
+
+    /// Start times (unix milliseconds) of the tool calls still running.
+    pub fn running(&self) -> impl Iterator<Item = i64> + '_ {
+        self.running.values().copied()
     }
 
     pub fn poll(&mut self) -> std::io::Result<Activity> {
@@ -111,20 +125,11 @@ impl Transcript {
         Ok(found)
     }
 
-    /// Whether `line` may hold the result of a pending `gh pr create` call.
-    fn may_hold_pr_result(&self, line: &[u8], marker: &[u8]) -> bool {
-        contains(line, marker) && self.pr_calls.iter().any(|id| contains(line, id.as_bytes()))
-    }
-
     fn scan_omp(&mut self, line: &[u8], found: &mut Activity) {
         let is_session = contains(line, b"\"type\":\"session\"");
         let is_message_link = contains(line, b"http")
             && (contains(line, b"\"role\":\"user\"") || contains(line, b"\"role\":\"assistant\""));
-        if !is_session
-            && !is_message_link
-            && !self.may_hold_pr_result(line, b"\"toolResult\"")
-            && !contains(line, b"\"toolCall\"")
-        {
+        if !is_session && !is_message_link && !contains(line, b"\"toolResult\"") && !contains(line, b"\"toolCall\"") {
             return;
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
@@ -134,11 +139,13 @@ impl Transcript {
             }
             return;
         }
+        self.line_ms = entry["timestamp"].as_str().and_then(unix_ms);
         let message = &entry["message"];
         match message["role"].as_str() {
             Some("toolResult") => {
-                let text: String = message["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect();
-                self.record_result(message["toolCallId"].as_str().unwrap_or_default(), &text, found);
+                let id = message["toolCallId"].as_str().unwrap_or_default();
+                let content = &message["content"];
+                self.record_result(id, || content.as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect(), found);
             }
             Some("user") => {
                 let text = message_text(&message["content"]);
@@ -163,10 +170,11 @@ impl Transcript {
     fn scan_claude(&mut self, line: &[u8], found: &mut Activity) {
         let is_message_link = contains(line, b"http")
             && (contains(line, b"\"type\":\"user\"") || contains(line, b"\"type\":\"assistant\""));
-        if !is_message_link && !contains(line, b"\"tool_use\"") && !self.may_hold_pr_result(line, b"\"tool_result\"") {
+        if !is_message_link && !contains(line, b"\"tool_use\"") && !contains(line, b"\"tool_result\"") {
             return;
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
+        self.line_ms = entry["timestamp"].as_str().and_then(unix_ms);
         if let Some(cwd) = entry["cwd"].as_str() {
             self.cwd = PathBuf::from(cwd);
         }
@@ -188,11 +196,11 @@ impl Transcript {
                 }
                 Some("tool_result") => {
                     let content = &block["content"];
-                    let text: String = match content.as_str() {
+                    let text = || match content.as_str() {
                         Some(text) => text.to_string(),
                         None => content.as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect(),
                     };
-                    self.record_result(block["tool_use_id"].as_str().unwrap_or_default(), &text, found);
+                    self.record_result(block["tool_use_id"].as_str().unwrap_or_default(), text, found);
                 }
                 _ => {}
             }
@@ -200,6 +208,9 @@ impl Transcript {
     }
 
     fn record_call(&mut self, id: Option<&str>, call: &Call, args: &Value, found: &mut Activity) {
+        if let (Some(id), Some(start)) = (id, self.line_ms) {
+            self.running.insert(id.to_string(), start);
+        }
         // Only arguments that name things (paths, commands, URLs): file contents being written
         // may well link pull requests the chat has nothing to do with.
         const CONTENT: &[&str] = &["content", "input", "new_string", "old_string", "code", "edits"];
@@ -240,9 +251,13 @@ impl Transcript {
         found.links.extend(urls(text).into_iter().map(|url| (url, self.line_end)));
     }
 
-    fn record_result(&mut self, id: &str, text: &str, found: &mut Activity) {
+    /// A tool call's result: closes its time window; for `gh pr create`, `text()` names the PR.
+    fn record_result(&mut self, id: &str, text: impl FnOnce() -> String, found: &mut Activity) {
+        if let (Some(start), Some(end)) = (self.running.remove(id), self.line_ms) {
+            found.calls.push((start, end.max(start)));
+        }
         if self.pr_calls.remove(id) {
-            found.prs.extend(github::pr_urls(text));
+            found.prs.extend(github::pr_urls(&text()));
         }
     }
 }
@@ -295,6 +310,29 @@ fn message_text(content: &Value) -> String {
         Some(text) => text.to_string(),
         None => content.as_array().into_iter().flatten().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
     }
+}
+
+/// Unix milliseconds of an RFC 3339 UTC timestamp as agents write them:
+/// `2026-10-12T08:55:29.567Z` (fraction optional).
+fn unix_ms(ts: &str) -> Option<i64> {
+    let num = |range: std::ops::Range<usize>| ts.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let millis = match ts.get(19..20) {
+        Some(".") => {
+            let digits: String = ts[20..].chars().take_while(char::is_ascii_digit).take(3).collect();
+            format!("{digits:0<3}").parse::<i64>().ok()?
+        }
+        _ => 0,
+    };
+    // Days since 1970-01-01 in the proleptic Gregorian calendar (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
 }
 
 /// A pull request named in full, or by number within some repository.
@@ -801,6 +839,27 @@ mod tests {
         assert_eq!(urls, ["https://a.io/one", "https://a.io/two", "https://a.io/three"]);
         // Positions say which line mentioned a link: the user's line comes before the agent's.
         assert!(links[0].1 < links[1].1 && links[1].1 == links[2].1, "{links:?}");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn tool_calls_span_from_their_line_to_their_result_s_line() {
+        let at = |ts: &str| format!(r#""timestamp":"{ts}""#);
+        let call = |ts: &str, id: &str| {
+            format!(r#"{{"type":"assistant",{},"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"git commit -m x"}}}}]}}}}"#, at(ts))
+        };
+        let result = |ts: &str, id: &str| {
+            format!(r#"{{"type":"user",{},"message":{{"role":"user","content":[{{"tool_use_id":"{id}","type":"tool_result","content":"ok"}}]}}}}"#, at(ts))
+        };
+        let (mut t, file) = transcript(
+            "calls",
+            Format::Claude,
+            &format!("{}\n{}\n{}\n", call("2026-10-12T13:38:09.250Z", "a"), call("2026-10-12T13:38:10Z", "b"), result("2026-10-12T13:38:12.5Z", "a")),
+        );
+        let start = unix_ms("2026-10-12T13:38:09.250Z").unwrap();
+        assert_eq!(start, 1_791_812_289_250, "date -u -d 2026-10-12T13:38:09Z +%s = 1791812289");
+        assert_eq!(t.poll().unwrap().calls, [(start, start + 3_250)]);
+        assert_eq!(t.running().collect::<Vec<_>>(), [start + 750], "b has no result yet");
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }

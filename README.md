@@ -2,8 +2,8 @@
 
 A [herdr](https://herdr.dev) plugin that docks a sidebar on the right of every tab running a
 coding agent and shows the tracks the agent's chat leaves behind: the git repos it changed,
-their uncommitted and unpushed files with line counts, and the pull requests it opened or is
-working on. Select a file to see its diff next to the agent.
+their uncommitted and unpushed files with line counts, the commits it made, and the pull
+requests it opened or is working on. Select a file or commit to see its diff next to the agent.
 
 ```
 herdr-tracks main ↑1
@@ -11,6 +11,7 @@ herdr-tracks main ↑1
   M src/sidebar.rs                     +268 -105
  ?? src/ansi.rs                              +80
  ↑  src/git.rs                           +32 -15
+ ● 3326d43 list pull requests newest first
 ```
 
 Linux only. Reads omp and Claude Code chat logs; other agents get the repos their processes
@@ -42,6 +43,11 @@ The sidebar follows the focused agent pane of its tab and lists, per repo:
 | ` ▸ #42 open ✓` | A pull request the chat opened or referred to: state and CI checks |
 | `  M`, `A `, `??` … | Uncommitted changes, as in `git status`, with lines added/removed |
 | ` ↑ ` | Files changed by commits not pushed yet |
+| ` ● 3326d43 …` | Commits the chat made, newest first (ten, then a count of the rest); those a listed pull request holds, or its merge commit, sit indented under it |
+
+A commit counts as the chat's when it was committed while one of the chat's tool calls ran:
+its own commits, merges and rebases, and pull requests it merged on GitHub; not older commits
+a merge brought in. Commits on any local or remote branch count, pushed or not.
 
 A repo is listed once the chat **changed** it: edited or wrote a file there, committed, or the
 repo's git state moved after the chat first touched it. Repos the chat only read are not
@@ -64,7 +70,7 @@ In the sidebar:
 
 | Input | Action |
 |---|---|
-| `↓` `↑` (`j` `k`) | Select the next / previous file or pull request; its diff opens next to the agent |
+| `↓` `↑` (`j` `k`) | Select the next / previous file, commit or pull request; its diff opens next to the agent |
 | `→` `←` (`l` `h`) | Expand / collapse a pull request into its files |
 | Click | Select a row and show its diff; on a pull request, also expand or collapse it |
 | `o`, Ctrl+click | Open the selected pull request in the browser |
