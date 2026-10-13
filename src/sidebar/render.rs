@@ -1,19 +1,17 @@
 //! Laying out and drawing the sidebar: repo headers, file and pull-request rows, the visible
 //! window of a long list, and terminal output.
 
-use super::collect::{is_dismissed, visible_prs};
 use super::{Click, Key, Menu, Model, Target};
+use crate::ansi::{self, fit_end, fit_start};
 use crate::diff::CommitAt;
 use crate::git::{Commit, LineStat, RepoStatus};
-use crate::github::{self, Checks, PrCommit, PrState};
+use crate::github::{self, Checks, PrCommit, PrState, PrView};
 use crate::state::PrRecord;
 use anyhow::Result;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Commits listed per repo; older ones are counted on one more row.
 const COMMITS_SHOWN: usize = 10;
@@ -33,44 +31,69 @@ pub(super) enum Tone {
     Bad,
     Waiting,
     Merged,
-    /// Clickable text (an OSC 8 hyperlink); underlined so it reads as a link.
+    /// Clickable text, drawn as an OSC 8 hyperlink to the row's URL; underlined so it reads as
+    /// a link.
     Link,
     /// An entry of the right-click menu.
     Menu,
-    /// A web link in the links block.
+    /// A web link in the links block, drawn as an OSC 8 hyperlink to the row's URL.
     Url,
 }
 
+/// A row's text: plain pieces, each in its tone.
 pub(super) type Line = Vec<(String, Tone)>;
 
-/// All rendered rows plus, by row index, what clicking and right-clicking each row acts on.
+/// One row and what it acts on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Row {
+    pub(super) line: Line,
+    /// What selecting or clicking it shows.
+    pub(super) click: Option<Click>,
+    /// What its right-click menu acts on.
+    pub(super) menu: Option<Target>,
+    /// The web link of a links block row.
+    pub(super) link: Option<String>,
+}
+
+impl Row {
+    fn new(line: Line) -> Self {
+        Row { line, ..Row::default() }
+    }
+
+    /// The URL it stands for: a link, or a pull request.
+    pub(super) fn url(&self) -> Option<&str> {
+        match &self.click {
+            Some(Click::Pr { url }) => Some(url),
+            _ => self.link.as_deref(),
+        }
+    }
+}
+
+/// A row of one piece of text, cut to fit.
+fn fitted(text: &str, tone: Tone, cols: usize) -> Row {
+    Row::new(vec![(fit_end(text, cols), tone)])
+}
+
+/// All rendered rows.
 pub(super) struct Screen {
-    pub(super) lines: Vec<Line>,
-    pub(super) clicks: HashMap<usize, Click>,
-    pub(super) menus: HashMap<usize, Target>,
+    pub(super) rows: Vec<Row>,
 }
 
 impl Screen {
-    /// Selectable rows in display order.
-    pub(super) fn rows(&self) -> Vec<(usize, &Click)> {
-        let mut rows: Vec<_> = self.clicks.iter().map(|(row, click)| (*row, click)).collect();
-        rows.sort_by_key(|(row, _)| *row);
-        rows
+    /// Selectable rows in display order, with their row index.
+    pub(super) fn clicks(&self) -> impl Iterator<Item = (usize, &Click)> {
+        self.rows.iter().enumerate().filter_map(|(at, row)| Some((at, row.click.as_ref()?)))
     }
 
     pub(super) fn row_of(&self, key: Option<&Key>) -> Option<usize> {
         let key = key?;
-        self.clicks.iter().find(|(_, click)| click.key() == *key).map(|(row, _)| *row)
+        self.clicks().find(|(_, click)| click.key() == *key).map(|(at, _)| at)
     }
 }
 
-/// The part of a [`Screen`] that fits the pane; clicks and menus keyed by on-screen row.
+/// The rows of a [`Screen`] that fit the pane, and the links block pinned below them.
 pub(super) struct View {
-    pub(super) lines: Vec<Line>,
-    pub(super) clicks: HashMap<usize, Click>,
-    pub(super) menus: HashMap<usize, Target>,
-    /// The URL of each row of the pinned links block.
-    pub(super) links: HashMap<usize, String>,
+    pub(super) rows: Vec<Row>,
     /// The row of the links block's rule, when there is a block.
     pub(super) links_top: Option<usize>,
     pub(super) highlight: Option<usize>,
@@ -78,110 +101,87 @@ pub(super) struct View {
 
 impl View {
     /// Pins `block` (see [`links`]) to the bottom of a `rows`-high pane, below the list.
-    pub(super) fn pin(&mut self, block: Vec<(Line, Option<String>)>, rows: usize) {
-        self.lines.resize(rows - block.len(), Vec::new());
+    pub(super) fn pin(&mut self, block: Vec<Row>, rows: usize) {
+        self.rows.resize_with(rows - block.len(), Row::default);
         if !block.is_empty() {
-            self.links_top = Some(self.lines.len());
+            self.links_top = Some(self.rows.len());
         }
-        for (line, url) in block {
-            let row = self.lines.len();
-            match url {
-                Some(url) => {
-                    self.menus.insert(row, Target::Link(url.clone()));
-                    self.links.insert(row, url);
-                }
-                // The rule.
-                None => {
-                    self.menus.insert(row, Target::Links);
-                }
-            }
-            self.lines.push(line);
-        }
-    }
-
-    /// The URL a row stands for: a link, or a pull request.
-    pub(super) fn url_at(&self, row: usize) -> Option<&str> {
-        match self.clicks.get(&row) {
-            Some(Click::Pr { url }) => Some(url),
-            _ => self.links.get(&row).map(String::as_str),
-        }
+        self.rows.extend(block);
     }
 
     /// The URL a click at `col` of `row` would open: a link, or a pull request's number and
     /// status (not its title).
     pub(super) fn pointer_url(&self, row: usize, col: usize) -> Option<&str> {
-        match self.clicks.get(&row) {
-            Some(Click::Pr { url }) => (zone(self.lines.get(row)?, col) == Zone::Link).then_some(url.as_str()),
-            _ => self.links.get(&row).map(String::as_str),
+        let row = self.rows.get(row)?;
+        match &row.click {
+            Some(Click::Pr { url }) => (zone(&row.line, col) == Zone::Link).then_some(url.as_str()),
+            _ => row.link.as_deref(),
         }
     }
 
     /// Draws the open menu over the rows it occupies.
     pub(super) fn overlay(&mut self, menu: &Menu, cols: usize, rows: usize) {
         for (row, _, label) in menu.placed(rows) {
-            while self.lines.len() <= row {
-                self.lines.push(Vec::new());
+            if self.rows.len() <= row {
+                self.rows.resize_with(row + 1, Row::default);
             }
             let text = fit_end(&format!(" ▸ {label}"), cols);
-            let pad = " ".repeat(cols.saturating_sub(text.width()));
-            self.lines[row] = vec![(format!("{text}{pad}"), Tone::Menu)];
+            let pad = " ".repeat(cols.saturating_sub(ansi::width(&text)));
+            self.rows[row].line = vec![(format!("{text}{pad}"), Tone::Menu)];
         }
     }
 }
 
 pub(super) fn render(model: &Model, cols: usize) -> Screen {
-    let mut lines: Vec<Line> = Vec::new();
-    let mut clicks: HashMap<usize, Click> = HashMap::new();
-    let mut menus: HashMap<usize, Target> = HashMap::new();
+    let mut rows: Vec<Row> = Vec::new();
     if let Some(err) = &model.error {
-        lines.push(vec![(fit_end(&format!("! {err}"), cols), Tone::Error)]);
+        rows.push(fitted(&format!("! {err}"), Tone::Error, cols));
     }
     let Some(session) = &model.session else {
-        lines.push(vec![(fit_end("no agent in this tab", cols), Tone::Dim)]);
-        return Screen { lines, clicks, menus };
+        rows.push(fitted("no agent in this tab", Tone::Dim, cols));
+        return Screen { rows };
     };
     if !session.title.is_empty() {
-        lines.push(vec![(fit_end(&session.title, cols), Tone::Dim)]);
+        rows.push(fitted(&session.title, Tone::Dim, cols));
     }
     // Repos the chat changed or has pull requests in (`refresh_git` skips deleted ones), then
     // PRs whose repo has no touched checkout. Whatever the user dismissed stays hidden.
     // Without a checkout, PRs go newest first by number: GitHub numbers them in creation order.
-    let mut prs: Vec<&PrRecord> = visible_prs(&session.repos).collect();
+    let saved = &session.saved;
+    let mut prs: Vec<&PrRecord> = saved.visible_prs().collect();
     prs.sort_by_key(|p| (p.pr.slug(), std::cmp::Reverse(p.pr.number)));
     let has_prs = |root: &PathBuf| prs.iter().any(|p| p.root.as_ref() == Some(root));
-    let shown: Vec<&PathBuf> = session
-        .repos
+    let shown: Vec<&PathBuf> = saved
         .repos
         .iter()
         .filter(|r| (r.changed || has_prs(&r.root)) && model.statuses.contains_key(&r.root))
-        .filter(|r| !is_dismissed(&session.repos, &r.root))
+        .filter(|r| !saved.repo_dismissed(&r.root))
         .map(|r| &r.root)
         .collect();
     let orphans: Vec<&PrRecord> = prs.iter().copied().filter(|p| p.root.is_none()).collect();
     if shown.is_empty() && orphans.is_empty() {
-        lines.push(vec![(fit_end("no changes yet", cols), Tone::Dim)]);
+        rows.push(fitted("no changes yet", Tone::Dim, cols));
     }
     for root in shown {
-        if !lines.is_empty() {
-            lines.push(Vec::new());
+        if !rows.is_empty() {
+            rows.push(Row::default());
         }
-        menus.insert(lines.len(), Target::Repo(root.clone()));
-        lines.push(repo_header(root, model.statuses.get(root), cols));
+        rows.push(Row { menu: Some(Target::Repo(root.clone())), ..Row::new(repo_header(root, model.statuses.get(root), cols)) });
         // Uncommitted work first: it is the freshest.
         match model.statuses.get(root) {
             None => {}
-            Some(Err(e)) => lines.push(vec![(fit_end(&format!(" ! {e}"), cols), Tone::Error)]),
+            Some(Err(e)) => rows.push(fitted(&format!(" ! {e}"), Tone::Error, cols)),
             Some(Ok(s)) => {
                 // Uncommitted changes (two-letter `git status` codes), then what unpushed
                 // commits change (`↑`).
                 for change in &s.changes {
                     let code = String::from_utf8_lossy(&change.code).into_owned();
-                    clicks.insert(lines.len(), Click::File { root: root.clone(), change: change.clone() });
-                    lines.push(file_row(" ", (code, change_tone(change.code)), &change.display(), change.stat, cols));
+                    let line = file_row(" ", (code, change_tone(change.code)), &change.display(), change.stat, cols);
+                    rows.push(Row { click: Some(Click::File { root: root.clone(), change: change.clone() }), ..Row::new(line) });
                 }
                 for (path, stat) in &s.unpushed {
-                    clicks.insert(lines.len(), Click::Unpushed { root: root.clone(), path: path.clone() });
-                    lines.push(file_row(" ", ("↑ ".into(), Tone::Branch), path, Some(*stat), cols));
+                    let line = file_row(" ", ("↑ ".into(), Tone::Branch), path, Some(*stat), cols);
+                    rows.push(Row { click: Some(Click::Unpushed { root: root.clone(), path: path.clone() }), ..Row::new(line) });
                 }
             }
         }
@@ -190,31 +190,31 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
         let mut loose = 0;
         for entry in &entries {
             match entry {
-                Entry::Pr { pr, .. } => push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols),
+                Entry::Pr { pr, .. } => push_pr(&mut rows, model, pr, cols),
                 Entry::Commit(commit) => {
                     loose += 1;
                     if loose <= COMMITS_SHOWN {
                         let at = CommitAt { hash: commit.hash.clone(), root: Some(root.clone()), repo: repo.clone() };
-                        let row = CommitLine { at, under: None, subject: &commit.subject, chat: true };
-                        push_commit(&mut lines, &mut clicks, model, row, " ", cols);
+                        let commit = CommitLine { at, under: None, subject: &commit.subject, chat: true };
+                        push_commit(&mut rows, model, commit, " ", cols);
                     } else if loose == COMMITS_SHOWN + 1 {
                         // Older loose commits are counted where the first of them would be.
                         let more = entries.iter().filter(|e| matches!(e, Entry::Commit(_))).count() - COMMITS_SHOWN;
-                        lines.push(vec![(fit_end(&earlier(" ", more), cols), Tone::Dim)]);
+                        rows.push(fitted(&earlier(" ", more), Tone::Dim, cols));
                     }
                 }
             }
         }
     }
     for pr in orphans {
-        if !lines.is_empty() {
-            lines.push(Vec::new());
+        if !rows.is_empty() {
+            rows.push(Row::default());
         }
-        menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
-        lines.push(vec![(fit_end(&format!("{}/{}", pr.pr.owner, pr.pr.repo), cols), Tone::Repo)]);
-        push_pr(&mut lines, &mut clicks, &mut menus, model, pr, cols);
+        let heading = fitted(&format!("{}/{}", pr.pr.owner, pr.pr.repo), Tone::Repo, cols);
+        rows.push(Row { menu: Some(Target::Pr(pr.pr.clone())), ..heading });
+        push_pr(&mut rows, model, pr, cols);
     }
-    Screen { lines, clicks, menus }
+    Screen { rows }
 }
 
 /// What a repo's history lists: a pull request, or a commit of the chat's that no listed pull
@@ -259,25 +259,17 @@ fn earlier(indent: &str, more: usize) -> String {
 
 /// A pull request row and, when expanded, its commits (the merge commit included), newest
 /// first, [`COMMITS_SHOWN`] at most.
-fn push_pr(
-    lines: &mut Vec<Line>,
-    clicks: &mut HashMap<usize, Click>,
-    menus: &mut HashMap<usize, Target>,
-    model: &Model,
-    pr: &PrRecord,
-    cols: usize,
-) {
+fn push_pr(rows: &mut Vec<Row>, model: &Model, pr: &PrRecord, cols: usize) {
     let url = pr.pr.url();
     let expanded = model.expanded.contains(&url);
-    clicks.insert(lines.len(), Click::Pr { url: url.clone() });
-    menus.insert(lines.len(), Target::Pr(pr.pr.clone()));
-    let title = model.pr_views.get(&url).map(|v| v.title.as_str());
-    lines.push(pr_line(pr, title, model.pr_errors.get(&url), expanded, cols));
+    let view = model.pr_views.get(&url);
+    let line = pr_line(pr.pr.number, view, model.pr_errors.get(&url), expanded, cols);
+    rows.push(Row { click: Some(Click::Pr { url: url.clone() }), menu: Some(Target::Pr(pr.pr.clone())), ..Row::new(line) });
     if !expanded {
         return;
     }
-    let Some(view) = model.pr_views.get(&url) else {
-        lines.push(vec![("    …".into(), Tone::Dim)]);
+    let Some(view) = view else {
+        rows.push(Row::new(vec![("    …".into(), Tone::Dim)]));
         return;
     };
     let chat: Vec<&Commit> = pr.root.as_ref().and_then(|root| model.commits.get(root)).into_iter().flatten().collect();
@@ -288,11 +280,11 @@ fn push_pr(
         // GitHub names no subject for the merge commit; the checkout may know it.
         let subject = commit.subject.as_deref().or(mine.map(|c| c.subject.as_str())).unwrap_or("merge commit");
         let at = CommitAt { hash: commit.oid.clone(), root: pr.root.clone(), repo: Some(pr.pr.slug()) };
-        let row = CommitLine { at, under: Some(url.clone()), subject, chat: mine.is_some() };
-        push_commit(lines, clicks, model, row, "   ", cols);
+        let commit = CommitLine { at, under: Some(url.clone()), subject, chat: mine.is_some() };
+        push_commit(rows, model, commit, "   ", cols);
     }
     if commits.len() > COMMITS_SHOWN {
-        lines.push(vec![(fit_end(&earlier("   ", commits.len() - COMMITS_SHOWN), cols), Tone::Dim)]);
+        rows.push(fitted(&earlier("   ", commits.len() - COMMITS_SHOWN), Tone::Dim, cols));
     }
 }
 
@@ -306,17 +298,18 @@ struct CommitLine<'a> {
 }
 
 /// A commit row and, when expanded, one row per file it changes.
-fn push_commit(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, model: &Model, row: CommitLine, indent: &str, cols: usize) {
-    let expanded = model.expanded.contains(&row.at.hash);
-    clicks.insert(lines.len(), Click::Commit { commit: row.at.clone(), under: row.under.clone() });
-    lines.push(commit_row(indent, &row, expanded, cols));
+fn push_commit(rows: &mut Vec<Row>, model: &Model, commit: CommitLine, indent: &str, cols: usize) {
+    let expanded = model.expanded.contains(&commit.at.hash);
+    let line = commit_row(indent, &commit, expanded, cols);
+    let CommitLine { at, under, .. } = commit;
+    rows.push(Row { click: Some(Click::Commit { commit: at.clone(), under }), ..Row::new(line) });
     if !expanded {
         return;
     }
     let indent = format!("{indent}   ");
-    match model.commit_files.get(&row.at.hash) {
-        None => lines.push(vec![(format!("{indent}…"), Tone::Dim)]),
-        Some(Err(e)) => lines.push(vec![(fit_end(&format!("{indent}! {e}"), cols), Tone::Error)]),
+    match model.commit_files.get(&at.hash) {
+        None => rows.push(Row::new(vec![(format!("{indent}…"), Tone::Dim)])),
+        Some(Err(e)) => rows.push(fitted(&format!("{indent}! {e}"), Tone::Error, cols)),
         Some(Ok(files)) => {
             for file in files {
                 let tone = match file.code {
@@ -324,8 +317,8 @@ fn push_commit(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, model:
                     'D' => Tone::Bad,
                     _ => Tone::Waiting,
                 };
-                clicks.insert(lines.len(), Click::CommitFile { commit: row.at.clone(), path: file.path.clone() });
-                lines.push(file_row(&indent, (file.code.to_string(), tone), &file.path, Some(file.stat), cols));
+                let line = file_row(&indent, (file.code.to_string(), tone), &file.path, Some(file.stat), cols);
+                rows.push(Row { click: Some(Click::CommitFile { commit: at.clone(), path: file.path.clone() }), ..Row::new(line) });
             }
         }
     }
@@ -333,11 +326,11 @@ fn push_commit(lines: &mut Vec<Line>, clicks: &mut HashMap<usize, Click>, model:
 
 /// `<indent>▸ 225ac66 merge the feature…`: expand marker (green for the chat's own commits),
 /// short hash, subject cut to fit (dim for commits the chat did not make).
-fn commit_row(indent: &str, row: &CommitLine, expanded: bool, cols: usize) -> Line {
-    let short: String = row.at.hash.chars().take(7).collect();
+fn commit_row(indent: &str, commit: &CommitLine, expanded: bool, cols: usize) -> Line {
+    let short: String = commit.at.hash.chars().take(7).collect();
     let prefix = format!("{indent}▸ {short} ");
-    let subject = fit_end(row.subject, cols.saturating_sub(prefix.width()));
-    let (marker, text) = if row.chat { (Tone::Good, Tone::Plain) } else { (Tone::Dim, Tone::Dim) };
+    let subject = fit_end(commit.subject, cols.saturating_sub(ansi::width(&prefix)));
+    let (marker, text) = if commit.chat { (Tone::Good, Tone::Plain) } else { (Tone::Dim, Tone::Dim) };
     vec![
         (indent.to_string(), Tone::Plain),
         ((if expanded { "▾" } else { "▸" }).into(), marker),
@@ -360,11 +353,11 @@ fn file_row(indent: &str, (code, tone): (String, Tone), path: &str, stat: Option
         Some(LineStat::Binary) => vec![("bin".into(), Tone::Dim)],
         None => Vec::new(),
     };
-    let stat_width = stat.iter().map(|(t, _)| t.width() + 1).sum::<usize>(); // each with a leading space
-    let prefix = indent.width() + code.width() + 1;
+    let stat_width = stat.iter().map(|(t, _)| ansi::width(t) + 1).sum::<usize>(); // each with a leading space
+    let prefix = ansi::width(indent) + ansi::width(&code) + 1;
     let path = fit_start(path, cols.saturating_sub(prefix + stat_width));
     let mut line = vec![(indent.to_string(), Tone::Plain), (code, tone), (" ".into(), Tone::Plain)];
-    let gap = cols.saturating_sub(prefix + path.width() + stat_width);
+    let gap = cols.saturating_sub(prefix + ansi::width(&path) + stat_width);
     line.push((path, Tone::Plain));
     if !stat.is_empty() {
         line.push((" ".repeat(gap), Tone::Plain));
@@ -377,59 +370,52 @@ fn file_row(indent: &str, (code, tone): (String, Tone), path: &str, stat: Option
 }
 
 /// ` ▸ PR#121 open ✓ fix the login`: expand marker, number (a link to the PR), state, CI
-/// rollup (omitted when the PR has no checks), title cut to fit.
-fn pr_line(pr: &PrRecord, title: Option<&str>, error: Option<&String>, expanded: bool, cols: usize) -> Line {
-    let number = format!("PR#{}", pr.pr.number);
-    let room = cols.saturating_sub(number.width() + 4);
+/// rollup (omitted when the PR has no checks), title cut to fit. Before the first fetch, `…` or
+/// the fetch's error instead of state and title.
+fn pr_line(number: u32, view: Option<&PrView>, error: Option<&String>, expanded: bool, cols: usize) -> Line {
+    let number = format!("PR#{number}");
+    let room = cols.saturating_sub(ansi::width(&number) + 4);
     let marker = if expanded { " ▾ " } else { " ▸ " };
-    let mut line = vec![(marker.into(), Tone::Dim), (hyperlink(&pr.pr.url(), &number), Tone::Link)];
-    match (pr.status, error) {
-        (Some(status), _) => {
-            let (state, tone) = match status.state {
-                PrState::Open => ("open", Tone::Good),
-                PrState::Draft => ("draft", Tone::Dim),
-                PrState::Merged => ("merged", Tone::Merged),
-                PrState::Closed => ("closed", Tone::Bad),
-            };
-            line.push((format!(" {state}"), tone));
-            if let Some(checks) = status.checks {
-                let (mark, tone) = match checks {
-                    Checks::Passing => ("✓", Tone::Good),
-                    Checks::Failing => ("✗", Tone::Bad),
-                    Checks::Pending => ("◔", Tone::Waiting),
-                };
-                line.push((format!(" {mark}"), tone));
-            }
+    let mut line = vec![(marker.into(), Tone::Dim), (number, Tone::Link)];
+    let Some(view) = view else {
+        match error {
+            Some(err) => line.push((format!(" {}", fit_end(&format!("! {err}"), room)), Tone::Error)),
+            None => line.push((" …".into(), Tone::Dim)),
         }
-        (None, Some(err)) => line.push((format!(" {}", fit_end(&format!("! {err}"), room)), Tone::Error)),
-        (None, None) => line.push((" …".into(), Tone::Dim)),
+        return line;
+    };
+    let (state, tone) = match view.status.state {
+        PrState::Open => ("open", Tone::Good),
+        PrState::Draft => ("draft", Tone::Dim),
+        PrState::Merged => ("merged", Tone::Merged),
+        PrState::Closed => ("closed", Tone::Bad),
+    };
+    line.push((format!(" {state}"), tone));
+    if let Some(checks) = view.status.checks {
+        let (mark, tone) = match checks {
+            Checks::Passing => ("✓", Tone::Good),
+            Checks::Failing => ("✗", Tone::Bad),
+            Checks::Pending => ("◔", Tone::Waiting),
+        };
+        line.push((format!(" {mark}"), tone));
     }
-    if let Some(title) = title.filter(|_| pr.status.is_some()) {
-        // The link escapes take no columns: count the number itself.
-        let used = marker.width() + number.width() + line[2..].iter().map(|(t, _)| t.width()).sum::<usize>();
-        let room = cols.saturating_sub(used + 1);
-        if room > 0 {
-            line.push((format!(" {}", fit_end(title, room)), Tone::Plain));
-        }
+    let used: usize = line.iter().map(|(t, _)| ansi::width(t)).sum();
+    let room = cols.saturating_sub(used + 1);
+    if room > 0 {
+        line.push((format!(" {}", fit_end(&view.title, room)), Tone::Plain));
     }
     line
 }
 
-/// OSC 8 hyperlink; herdr opens it on Ctrl+click. The escapes take no columns, so callers
-/// measure `text`, not the result.
-fn hyperlink(url: &str, text: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
-}
-
 /// The links block pinned to the bottom of the pane: a rule, then the chat's links, newest
-/// first, from `scroll` on as far as `max` rows allow, each with its URL. When not all fit, the
-/// rule counts them: `─ links 4–12 of 30`. `scroll` is clamped to the list. Pull requests
-/// already listed above are left out. Empty when there is nothing to show or no room.
-pub(super) fn links(model: &Model, cols: usize, max: usize, scroll: &mut usize) -> Vec<(Line, Option<String>)> {
+/// first, from `scroll` on as far as `max` rows allow. When not all fit, the rule counts them:
+/// `─ links 4–12 of 30`. `scroll` is clamped to the list. Pull requests already listed above
+/// are left out. Empty when there is nothing to show or no room.
+pub(super) fn links(model: &Model, cols: usize, max: usize, scroll: &mut usize) -> Vec<Row> {
     let Some(session) = &model.session else { return Vec::new() };
-    let listed = |url: &str| github::pr_urls(url).iter().any(|pr| session.repos.prs.iter().any(|p| p.pr.same(pr)));
-    let dismissed = |url: &str| session.repos.dismissed_links.iter().any(|d| d.url == url);
-    let urls: Vec<&String> = session.links.iter().filter(|url| !listed(url) && !dismissed(url)).collect();
+    let saved = &session.saved;
+    let listed = |url: &str| github::pr_urls(url).iter().any(|pr| saved.prs.iter().any(|p| p.pr.same(pr)));
+    let urls: Vec<&String> = session.links.iter().filter(|url| !listed(url) && !saved.link_dismissed(url)).collect();
     let room = max.saturating_sub(1);
     if urls.is_empty() || room == 0 {
         return Vec::new();
@@ -441,11 +427,11 @@ pub(super) fn links(model: &Model, cols: usize, max: usize, scroll: &mut usize) 
         (first, last) if first == last => format!("─ links {first} of {} ", urls.len()),
         (first, last) => format!("─ links {first}–{last} of {} ", urls.len()),
     };
-    let rule = format!("{title}{}", "─".repeat(cols.saturating_sub(title.width())));
-    let mut block = vec![(vec![(fit_end(&rule, cols), Tone::Dim)], None)];
+    let rule = format!("{title}{}", "─".repeat(cols.saturating_sub(ansi::width(&title))));
+    let mut block = vec![Row { menu: Some(Target::Links), ..fitted(&rule, Tone::Dim, cols) }];
     for url in shown {
-        let text = link_text(url, cols.saturating_sub(1));
-        block.push((vec![(" ".into(), Tone::Plain), (hyperlink(url, &text), Tone::Url)], Some((*url).clone())));
+        let line = vec![(" ".into(), Tone::Plain), (link_text(url, cols.saturating_sub(1)), Tone::Url)];
+        block.push(Row { menu: Some(Target::Link((*url).clone())), link: Some((*url).clone()), ..Row::new(line) });
     }
     block
 }
@@ -455,10 +441,10 @@ pub(super) fn links(model: &Model, cols: usize, max: usize, scroll: &mut usize) 
 fn link_text(url: &str, max: usize) -> String {
     let shown = url.trim_start_matches("https://").trim_start_matches("http://").trim_start_matches("www.");
     let (host, path) = shown.split_once('/').unwrap_or((shown, ""));
-    if shown.width() <= max || host.width() + 10 > max {
+    if ansi::width(shown) <= max || ansi::width(host) + 10 > max {
         return fit_end(shown, max);
     }
-    let tail = fit_start(&format!("/{path}"), max - host.width());
+    let tail = fit_start(&format!("/{path}"), max - ansi::width(host));
     // Start the tail at a path segment rather than mid-name, when there is one to start at.
     match tail.find('/') {
         Some(at) => format!("{host}…{}", &tail[at..]),
@@ -476,7 +462,7 @@ pub(super) fn repo_header(root: &Path, status: Option<&Result<RepoStatus, String
         .filter(|(n, _)| *n > 0)
         .map(|(n, arrow)| format!(" {arrow}{n}"))
         .collect();
-    let room = cols.saturating_sub(name.width() + 1 + tracking.width());
+    let room = cols.saturating_sub(ansi::width(&name) + 1 + ansi::width(&tracking));
     let mut line = vec![(name, Tone::Repo)];
     if room >= 2 {
         line.push((" ".into(), Tone::Plain));
@@ -498,19 +484,12 @@ fn change_tone(code: [u8; 2]) -> Tone {
 }
 
 /// The rows that fit a `rows`-high pane. Scrolls so `selected` stays visible; when rows are
-/// left below, the last line counts them instead. Clicks and menus are re-keyed to on-screen rows.
+/// left below, the last row counts them instead.
 pub(super) fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usize, selected: Option<usize>) -> View {
-    let total = screen.lines.len();
+    let total = screen.rows.len();
     if total <= rows {
         *scroll = 0;
-        return View {
-            lines: screen.lines.clone(),
-            clicks: screen.clicks.clone(),
-            menus: screen.menus.clone(),
-            links: HashMap::new(),
-            links_top: None,
-            highlight: selected,
-        };
+        return View { rows: screen.rows.clone(), links_top: None, highlight: selected };
     }
     let body = rows.saturating_sub(1);
     if let Some(row) = selected {
@@ -522,71 +501,22 @@ pub(super) fn window(screen: &Screen, cols: usize, rows: usize, scroll: &mut usi
     }
     *scroll = (*scroll).min(total - body);
     let end = *scroll + body;
-    let mut lines = screen.lines[*scroll..end].to_vec();
+    let mut shown = screen.rows[*scroll..end].to_vec();
     if end < total {
-        lines.push(vec![(fit_end(&format!("… {} more lines", total - end), cols), Tone::Dim)]);
+        shown.push(fitted(&format!("… {} more lines", total - end), Tone::Dim, cols));
     }
-    let in_view = |row: usize| (*scroll..end).contains(&row).then(|| row - *scroll);
-    View {
-        lines,
-        clicks: screen.clicks.iter().filter_map(|(row, click)| Some((in_view(*row)?, click.clone()))).collect(),
-        menus: screen.menus.iter().filter_map(|(row, target)| Some((in_view(*row)?, target.clone()))).collect(),
-        links: HashMap::new(),
-        links_top: None,
-        highlight: selected.and_then(in_view),
-    }
+    let highlight = selected.filter(|row| (*scroll..end).contains(row)).map(|row| row - *scroll);
+    View { rows: shown, links_top: None, highlight }
 }
 
-/// Truncates keeping the start: `long-branch-na…`.
-fn fit_end(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w + 1 > max {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    if max > 0 {
-        out.push('…');
-    }
-    out
-}
-
-/// Truncates keeping the end, where file names live: `…/deep/file.rs`.
-fn fit_start(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    let mut tail: Vec<char> = Vec::new();
-    let mut used = 0;
-    for c in s.chars().rev() {
-        let w = c.width().unwrap_or(0);
-        if used + w + 1 > max {
-            break;
-        }
-        tail.push(c);
-        used += w;
-    }
-    let mut out = String::from(if max > 0 { "…" } else { "" });
-    out.extend(tail.into_iter().rev());
-    out
-}
-
-/// The screen column of a row's expand marker (`▸`/`▾`), if it has one. It precedes any link
-/// escapes on the row, so plain character widths count.
+/// The screen column of a row's expand marker (`▸`/`▾`), if it has one.
 pub(super) fn marker_column(line: &Line) -> Option<usize> {
     let mut col = 0;
-    for c in line.iter().flat_map(|(text, _)| text.chars()) {
-        if matches!(c, '▸' | '▾') {
-            return Some(col);
+    for (text, _) in line {
+        if let Some(at) = text.find(['▸', '▾']) {
+            return Some(col + ansi::width(&text[..at]));
         }
-        col += c.width().unwrap_or(0);
+        col += ansi::width(text);
     }
     None
 }
@@ -613,7 +543,7 @@ pub(super) fn zone(line: &Line, col: usize) -> Zone {
             Tone::Plain if link.is_some() && title.is_none() => title = Some(at),
             _ => {}
         }
-        at += crate::ansi::width(text);
+        at += ansi::width(text);
     }
     match link {
         Some(start) if col >= start && col < title.unwrap_or(usize::MAX) => Zone::Link,
@@ -621,26 +551,32 @@ pub(super) fn zone(line: &Line, col: usize) -> Zone {
     }
 }
 
-/// Draws the view; the link or pull request under the pointer (`hover`, see [`View::url_at`])
-/// is underlined and bold.
+/// Draws the view. Link and URL text is an OSC 8 hyperlink to the row's URL (herdr opens it
+/// on Ctrl+click); under the pointer (`hover`, see [`Row::url`]) it is underlined and bold.
 pub(super) fn draw(view: &View, cols: usize, hover: Option<&str>) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    for (row, line) in view.lines.iter().enumerate() {
-        let highlighted = view.highlight == Some(row);
-        let hovered = hover.is_some() && view.url_at(row) == hover;
-        queue!(out, cursor::MoveTo(0, row as u16))?;
-        for (text, tone) in line {
+    for (at, row) in view.rows.iter().enumerate() {
+        let highlighted = view.highlight == Some(at);
+        let url = row.url();
+        let hovered = hover.is_some() && url == hover;
+        queue!(out, cursor::MoveTo(0, at as u16))?;
+        for (text, tone) in &row.line {
             style(&mut out, *tone)?;
             if highlighted {
                 queue!(out, SetAttribute(Attribute::Reverse))?;
             }
-            if hovered && matches!(tone, Tone::Url | Tone::Link) {
-                queue!(out, SetAttribute(Attribute::Underlined), SetAttribute(Attribute::Bold))?;
+            match url.filter(|_| matches!(tone, Tone::Url | Tone::Link)) {
+                Some(url) => {
+                    if hovered {
+                        queue!(out, SetAttribute(Attribute::Underlined), SetAttribute(Attribute::Bold))?;
+                    }
+                    queue!(out, Print("\x1b]8;;"), Print(url), Print("\x1b\\"), Print(text), Print("\x1b]8;;\x1b\\"))?;
+                }
+                None => queue!(out, Print(text))?,
             }
-            queue!(out, Print(text), SetAttribute(Attribute::Reset), ResetColor)?;
+            queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
         }
-        // Rows may carry link escapes: count only the columns they show.
-        let used: usize = line.iter().map(|(text, _)| crate::ansi::width(text)).sum();
+        let used: usize = row.line.iter().map(|(text, _)| ansi::width(text)).sum();
         if highlighted {
             let pad = " ".repeat(cols.saturating_sub(used));
             queue!(out, SetAttribute(Attribute::Reverse), Print(pad), SetAttribute(Attribute::Reset))?;
@@ -652,8 +588,8 @@ pub(super) fn draw(view: &View, cols: usize, hover: Option<&str>) -> Result<()> 
     }
     // Below a full pane there is nothing to clear: the cursor would stop on the last row and the
     // erase would wipe it.
-    if view.lines.len() < usize::from(terminal::size()?.1) {
-        queue!(out, cursor::MoveTo(0, view.lines.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    if view.rows.len() < usize::from(terminal::size()?.1) {
+        queue!(out, cursor::MoveTo(0, view.rows.len() as u16), terminal::Clear(terminal::ClearType::FromCursorDown))?;
     }
     out.flush()?;
     Ok(())
@@ -681,27 +617,214 @@ fn style(out: &mut impl Write, tone: Tone) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::DiffRequest;
+    use crate::git::{Change, FileChange};
+    use crate::sidebar::fixture::{clean, fixture, gh, pr, root, session, text, view};
+
+    fn keys(screen: &Screen) -> Vec<Key> {
+        screen.clicks().map(|(_, click)| click.key()).collect()
+    }
+
+    fn row<'a>(screen: &'a Screen, key: &Key) -> &'a Row {
+        &screen.rows[screen.row_of(Some(key)).expect("row is shown")]
+    }
+
+    /// The chat's commits `h0`..`h<n-1>` in `/r/e2e`, committed at their number.
+    fn commits(n: i64) -> Vec<Commit> {
+        (0..n).rev().map(|n| Commit { hash: format!("h{n}"), time: n, subject: format!("commit {n}") }).collect()
+    }
+
+    fn at(hash: &str, repo: Option<&str>) -> CommitAt {
+        CommitAt { hash: hash.into(), root: Some(root("e2e")), repo: repo.map(String::from) }
+    }
 
     #[test]
-    fn truncation_respects_display_width() {
-        assert_eq!(fit_end("feature/long-name", 8), "feature…");
-        assert_eq!(fit_start("src/deep/module/file.rs", 10), "…e/file.rs");
-        assert_eq!(fit_start("日本語のファイル.rs", 9), "…イル.rs");
-        assert_eq!(fit_end("short", 8), "short");
+    fn long_branch_names_give_way_to_the_ahead_behind_counts() {
+        let status = RepoStatus { branch: "nightly-maintenance-2026-09-29".into(), ahead: 1, behind: 2, ..clean() };
+        let header = text(&repo_header(&root("e2e"), Some(&Ok(status)), 30));
+        assert_eq!(header, "e2e nightly-maintenance… ↑1 ↓2");
+        assert_eq!(ansi::width(&header), 30);
+    }
+
+    #[test]
+    fn unpushed_files_are_rows_after_the_uncommitted_ones() {
+        let mut model = fixture(&["e2e"], &[]);
+        let changes = vec![Change { code: *b" M", path: "a.py".into(), orig: None, stat: None }];
+        let unpushed = vec![("e2e/b.py".into(), LineStat::Lines { added: 4, removed: 1 })];
+        model.statuses.insert(root("e2e"), Ok(RepoStatus { changes, unpushed, ..clean() }));
+        let screen = render(&model, 40);
+        let unpushed = Key::Unpushed(root("e2e"), "e2e/b.py".into());
+        assert_eq!(keys(&screen), [Key::File(root("e2e"), "a.py".into()), unpushed.clone()]);
+        let diff = row(&screen, &unpushed).click.as_ref().unwrap().diff_request();
+        assert_eq!(diff, DiffRequest::Unpushed { root: root("e2e"), path: "e2e/b.py".into() });
+    }
+
+    #[test]
+    fn the_chat_s_commits_show_newest_first_and_count_the_rest() {
+        let mut model = fixture(&["e2e"], &[]);
+        model.commits.insert(root("e2e"), commits(12));
+        let screen = render(&model, 40);
+        assert_eq!(keys(&screen), (2..12).rev().map(|n| Key::Commit(format!("h{n}"))).collect::<Vec<_>>());
+        let last = screen.rows.last().unwrap();
+        assert!(last.click.is_none() && text(&last.line).contains(" 2 earlier"), "{:?}", last.line);
+        let newest = row(&screen, &Key::Commit("h11".into())).click.as_ref().unwrap();
+        assert_eq!(newest.diff_request(), DiffRequest::Commit { commit: at("h11", None), path: None });
+    }
+
+    #[test]
+    fn prs_and_commits_list_freshest_first() {
+        // A PR is as fresh as the newest of the chat's commits it holds (or its last activity
+        // on GitHub); a PR not fetched yet goes last.
+        let mut model = fixture(&["e2e"], &[pr("e2e", 5), pr("e2e", 6)]);
+        model.commits.insert(root("e2e"), commits(12));
+        let held = vec![gh("h3", "gh 3", 3), gh("h7", "gh 7", 7), gh("x1", "someone else's", 8)];
+        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, held));
+        let commits = |ns: &[i64]| ns.iter().map(|n| Key::Commit(format!("h{n}"))).collect::<Vec<_>>();
+        let prs = |n| vec![Key::Pr(pr("e2e", n).url())];
+        let expected = [commits(&[11, 10, 9, 8]), prs(5), commits(&[6, 5, 4, 2, 1, 0]), prs(6)].concat();
+        assert_eq!(keys(&render(&model, 40)), expected);
+    }
+
+    #[test]
+    fn pull_requests_list_newest_first_whatever_order_the_chat_named_them() {
+        let model = fixture(&["kil"], &[840, 843, 9, 841].map(|n| pr("kil", n)));
+        let expected: Vec<Key> = [843, 841, 840, 9].iter().map(|n| Key::Pr(pr("kil", *n).url())).collect();
+        assert_eq!(keys(&render(&model, 40)), expected);
+    }
+
+    #[test]
+    fn pr_rows_show_the_fetched_state_and_the_title_cut_to_fit() {
+        let mut model = fixture(&["e2e"], &[pr("e2e", 5), pr("e2e", 6), pr("e2e", 7)]);
+        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, Vec::new()));
+        model.pr_errors.insert(pr("e2e", 7).url(), "gh: offline".into());
+        let screen = render(&model, 40);
+        let shown = |number| text(&row(&screen, &Key::Pr(pr("e2e", number).url())).line);
+        assert_eq!(ansi::width(&shown(5)), 40);
+        assert!(shown(5).ends_with("PR#5 open lodge every beneficial own…"), "{:?}", shown(5));
+        assert!(shown(6).ends_with("PR#6 …"), "not fetched yet: {:?}", shown(6));
+        assert!(shown(7).ends_with("PR#7 ! gh: offline"), "{:?}", shown(7));
+    }
+
+    #[test]
+    fn pr_rows_split_into_marker_link_and_title() {
+        let mut model = fixture(&["e2e"], &[pr("e2e", 5)]);
+        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, Vec::new()));
+        let screen = render(&model, 40);
+        let line = &row(&screen, &Key::Pr(pr("e2e", 5).url())).line;
+        let shown = text(line);
+        let col = |piece: &str| ansi::width(&shown[..shown.find(piece).unwrap()]);
+        // The marker expands, number and status open the browser, the title shows the diff.
+        let zones = ["▸", "PR#5", "open", "lodge"].map(|piece| zone(line, col(piece)));
+        assert_eq!(zones, [Zone::Marker, Zone::Link, Zone::Link, Zone::Body]);
+    }
+
+    #[test]
+    fn expanded_prs_list_their_commits_and_expanded_commits_their_files() {
+        let mut model = fixture(&["e2e"], &[pr("e2e", 5)]);
+        model.commits.insert(root("e2e"), commits(12));
+        let held = vec![gh("h3", "gh 3", 3), gh("h7", "gh 7", 7), gh("x1", "someone else's", 8)];
+        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, held));
+        model.expanded.insert(pr("e2e", 5).url());
+        model.expanded.insert("h7".into());
+        let stat = LineStat::Lines { added: 1, removed: 0 };
+        model.commit_files.insert("h7".into(), Ok(vec![FileChange { code: 'M', path: "a.py".into(), stat }]));
+        let screen = render(&model, 40);
+        // All the PR's commits, newest first: the chat's own marked green, others dim; the
+        // expanded commit's files under it, each with its diff in the commit.
+        let pr_at = screen.row_of(Some(&Key::Pr(pr("e2e", 5).url()))).unwrap();
+        let under = &screen.rows[pr_at + 1..pr_at + 5];
+        let under_keys: Vec<Key> = under.iter().filter_map(|r| r.click.as_ref().map(Click::key)).collect();
+        let commit = |hash: &str| Key::Commit(hash.into());
+        assert_eq!(under_keys, [commit("x1"), commit("h7"), Key::CommitFile("h7".into(), "a.py".into()), commit("h3")]);
+        assert_eq!(under[0].line[1].1, Tone::Dim, "not the chat's commit");
+        assert_eq!(under[1].line[1].1, Tone::Good, "the chat's commit");
+        assert_eq!(under[1].click, Some(Click::Commit { commit: at("h7", Some("o/e2e")), under: Some(pr("e2e", 5).url()) }));
+        let file_diff = under[2].click.as_ref().unwrap().diff_request();
+        assert_eq!(file_diff, DiffRequest::Commit { commit: at("h7", Some("o/e2e")), path: Some("a.py".into()) });
+        // Only the expand markers toggle: a PR's, a commit's under it; file rows have none.
+        assert_eq!(marker_column(&screen.rows[pr_at].line), Some(1));
+        assert_eq!(marker_column(&under[1].line), Some(3));
+        assert_eq!(marker_column(&under[2].line), None);
+        assert!(text(&screen.rows[pr_at].line).contains('▾') && text(&under[1].line).contains('▾'), "expanded markers");
+    }
+
+    #[test]
+    fn repo_and_pr_rows_carry_their_menu_targets() {
+        let mut model = fixture(&["mine", "e2e"], &[pr("e2e", 36), pr("infra", 133)]);
+        session(&mut model).saved.repos[1].changed = false;
+        let screen = render(&model, 40);
+        let menus: Vec<Target> = screen.rows.iter().filter_map(|r| r.menu.clone()).collect();
+        // e2e is shown for its PR; #133 has no checkout and a heading of its own.
+        let (mine, e2e, infra) = (Target::Repo(root("mine")), Target::Repo(root("e2e")), Target::Pr(pr("infra", 133)));
+        assert_eq!(menus, [mine, e2e, Target::Pr(pr("e2e", 36)), infra.clone(), infra]);
+    }
+
+    #[test]
+    fn links_are_pinned_to_the_bottom_newest_first_without_listed_prs() {
+        let mut model = fixture(&[], &[pr("r", 7)]);
+        let listed = format!("{}/files", pr("r", 7).url());
+        session(&mut model).links = ["https://www.new.io/a", &listed, "https://mid.io/b", "https://old.io/c"].map(String::from).into();
+        // Room for the rule and two links: the newest two that are not PR rows already.
+        let block = links(&model, 30, 3, &mut 0);
+        let urls: Vec<&str> = block.iter().filter_map(|r| r.link.as_deref()).collect();
+        assert_eq!(urls, ["https://www.new.io/a", "https://mid.io/b"]);
+        assert_eq!(text(&block[1].line), " new.io/a", "scheme and www. are not shown");
+        let menus: Vec<_> = block.iter().map(|r| r.menu.clone()).collect();
+        assert_eq!(menus, [Some(Target::Links), Some(Target::Link(urls[0].into())), Some(Target::Link(urls[1].into()))]);
+        assert!(links(&model, 30, 1, &mut 0).is_empty(), "no room for a link: no block");
+
+        // Pinned to the last rows of a 10-row pane, where a row stands for its link.
+        let mut view = window(&render(&model, 30), 30, 10 - block.len(), &mut 0, None);
+        view.pin(block, 10);
+        assert_eq!(view.rows.len(), 10);
+        assert_eq!(view.links_top, Some(7));
+        assert_eq!([8, 9].map(|row| view.rows[row].url()), [Some("https://www.new.io/a"), Some("https://mid.io/b")]);
+
+        // Scrolled past the end, the block shows the last links and the rule counts them.
+        let mut scroll = 9;
+        let block = links(&model, 30, 2, &mut scroll);
+        assert_eq!(scroll, 2, "three links, room for one");
+        assert!(text(&block[0].line).starts_with("─ links 3 of 3 ─"), "{:?}", block[0].line);
+        assert_eq!(block[1].link.as_deref(), Some("https://old.io/c"));
+    }
+
+    #[test]
+    fn the_window_keeps_rows_whole_and_scrolls_to_the_selection() {
+        let mut model = fixture(&["app"], &[pr("app", 7)]);
+        session(&mut model).title = "chat".into();
+        let change = |path: &str| Change { code: *b" M", path: path.into(), orig: None, stat: None };
+        model.statuses.insert(root("app"), Ok(RepoStatus { changes: vec![change("a.rs"), change("b.rs")], ..clean() }));
+        // Title, blank, repo header, two files, the PR: six rows for five.
+        let screen = render(&model, 40);
+        let shown_keys = |view: &View| view.rows.iter().filter_map(|r| r.click.as_ref().map(Click::key)).collect::<Vec<_>>();
+        let mut scroll = 0;
+        let view = window(&screen, 40, 5, &mut scroll, None);
+        assert_eq!(view.rows.len(), 5);
+        assert_eq!(shown_keys(&view), [Key::File(root("app"), "a.rs".into())], "the last row counts the rest");
+
+        // Selecting the last row scrolls it into view; the highlight follows the scroll.
+        let pr_key = Key::Pr(pr("app", 7).url());
+        let view = window(&screen, 40, 5, &mut scroll, screen.row_of(Some(&pr_key)));
+        assert_eq!(scroll, 2);
+        let highlight = view.highlight.unwrap();
+        assert_eq!(view.rows[highlight].click.as_ref().map(Click::key), Some(pr_key));
+        assert_eq!(shown_keys(&view)[0], Key::File(root("app"), "a.rs".into()));
+        // A pull request row stands for its URL; a repo header doesn't.
+        assert_eq!(view.rows[highlight].url(), Some(pr("app", 7).url().as_str()));
+        assert_eq!(view.rows[0].url(), None);
     }
 
     #[test]
     fn file_rows_right_align_line_counts_and_shorten_the_path() {
-        let text = |line: &Line| line.iter().map(|(t, _)| t.as_str()).collect::<String>();
         let stat = |added, removed| Some(LineStat::Lines { added, removed });
         let row = file_row(" ", (" M".into(), Tone::Unstaged), "src/a.rs", stat(12, 3), 24);
         assert_eq!(text(&row), format!("  M src/a.rs{}+12 -3", " ".repeat(6)));
-        assert_eq!(text(&row).width(), 24, "counts end at the right edge");
+        assert_eq!(ansi::width(&text(&row)), 24, "counts end at the right edge");
         assert!(row.contains(&("+12".into(), Tone::Good)) && row.contains(&("-3".into(), Tone::Bad)));
         // Long paths give way to the counts; zero counts and missing stats are left out.
         let row = file_row(" ", ("??".into(), Tone::Untracked), "deep/nested/dir/new_file.rs", stat(40, 0), 24);
         assert_eq!(text(&row), " ?? …dir/new_file.rs +40");
-        assert_eq!(text(&row).width(), 24);
+        assert_eq!(ansi::width(&text(&row)), 24);
         assert_eq!(text(&file_row(" ", ("A ".into(), Tone::Staged), "logo.png", Some(LineStat::Binary), 20)), " A  logo.png     bin");
         assert_eq!(text(&file_row(" ", (" M".into(), Tone::Unstaged), "x.rs", None, 20)), "  M x.rs");
     }

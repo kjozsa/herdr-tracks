@@ -68,6 +68,16 @@ pub struct Activity {
     pub calls: Vec<(i64, i64)>,
 }
 
+impl Activity {
+    /// Files a pull request named in full, or by number within the repo of `dir`.
+    fn mention(&mut self, mention: PrMention, dir: impl FnOnce() -> PathBuf) {
+        match mention {
+            PrMention::Full(pr) => self.prs.push(pr),
+            PrMention::Number(n) => self.pr_numbers.push((n, dir())),
+        }
+    }
+}
+
 impl Transcript {
     pub fn new(format: Format, session_ref: String, fallback_cwd: PathBuf) -> Self {
         Self {
@@ -147,11 +157,7 @@ impl Transcript {
                 let content = &message["content"];
                 self.record_result(id, || content.as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect(), found);
             }
-            Some("user") => {
-                let text = message_text(&message["content"]);
-                found.prs.extend(github::pr_urls(&text));
-                self.record_links(&text, found);
-            }
+            Some("user") => self.record_text(&message_text(&message["content"]), found),
             _ => {
                 for block in message["content"].as_array().into_iter().flatten() {
                     match block["type"].as_str() {
@@ -181,9 +187,7 @@ impl Transcript {
         let content = &entry["message"]["content"];
         if entry["type"] == "user" {
             // The user's own words: a plain string or text blocks (not tool results).
-            let text = message_text(content);
-            found.prs.extend(github::pr_urls(&text));
-            self.record_links(&text, found);
+            self.record_text(&message_text(content), found);
         }
         for block in content.as_array().into_iter().flatten() {
             match block["type"].as_str() {
@@ -222,13 +226,9 @@ impl Transcript {
             .filter_map(|(_, value)| value.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        found.prs.extend(github::pr_urls(&raw));
-        self.record_links(&raw, found);
+        self.record_text(&raw, found);
         for mention in pr_scheme_refs(&raw) {
-            match mention {
-                PrMention::Full(pr) => found.prs.push(pr),
-                PrMention::Number(n) => found.pr_numbers.push((n, self.cwd.clone())),
-            }
+            found.mention(mention, || self.cwd.clone());
         }
         if let Call::Shell { command, cwd } = call {
             let tokens = shell_tokens(command);
@@ -237,14 +237,17 @@ impl Transcript {
             }
             let dir = cwd.and_then(|c| resolve(c, &self.cwd)).unwrap_or_else(|| self.cwd.clone());
             for (mention, dir) in gh_pr_refs(command, &dir) {
-                match mention {
-                    PrMention::Full(pr) => found.prs.push(pr),
-                    PrMention::Number(n) => found.pr_numbers.push((n, dir)),
-                }
+                found.mention(mention, || dir);
             }
         }
         let at = Some(self.line_end);
         found.touches.extend(call_touches(call, &self.cwd).into_iter().map(|t| Touch { at, ..t }));
+    }
+
+    /// Pull-request URLs and web links in text the user or the agent wrote.
+    fn record_text(&self, text: &str, found: &mut Activity) {
+        found.prs.extend(github::pr_urls(text));
+        self.record_links(text, found);
     }
 
     fn record_links(&self, text: &str, found: &mut Activity) {

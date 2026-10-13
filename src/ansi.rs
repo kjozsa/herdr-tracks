@@ -1,19 +1,21 @@
-//! Display width of text that carries ANSI escape sequences (SGR colours, OSC 8 links).
+//! Display width of text that carries ANSI escape sequences (SGR colours, OSC 8 links), and
+//! cutting text to a width.
 
 use unicode_width::UnicodeWidthChar;
 
-/// Walks `line`, yielding escape sequences whole and visible characters one by one.
-fn segments(line: &str) -> impl Iterator<Item = (&str, bool)> {
+/// Walks `line`, yielding escape sequences whole (with no width) and visible characters one
+/// by one, with their display width.
+fn segments(line: &str) -> impl Iterator<Item = (&str, Option<usize>)> {
     let mut rest = line;
     std::iter::from_fn(move || {
         if rest.is_empty() {
             return None;
         }
         let len = escape_len(rest).unwrap_or_else(|| rest.chars().next().map_or(1, char::len_utf8));
-        let is_escape = rest.starts_with('\x1b');
         let (head, tail) = rest.split_at(len);
         rest = tail;
-        Some((head, !is_escape))
+        let width = (!head.starts_with('\x1b')).then(|| head.chars().next().and_then(|c| c.width()).unwrap_or(0));
+        Some((head, width))
     })
 }
 
@@ -42,16 +44,15 @@ fn escape_len(s: &str) -> Option<usize> {
 
 /// Columns the text occupies on screen.
 pub fn width(line: &str) -> usize {
-    segments(line).filter(|(_, visible)| *visible).map(|(c, _)| c.chars().next().and_then(|c| c.width()).unwrap_or(0)).sum()
+    segments(line).filter_map(|(_, w)| w).sum()
 }
 
 /// Cuts the text to `cols` display columns, keeping escape sequences intact.
 pub fn fit(line: &str, cols: usize) -> String {
     let mut out = String::with_capacity(line.len());
     let mut used = 0;
-    for (segment, visible) in segments(line) {
-        if visible {
-            let w = segment.chars().next().and_then(|c| c.width()).unwrap_or(0);
+    for (segment, w) in segments(line) {
+        if let Some(w) = w {
             if used + w > cols {
                 break;
             }
@@ -60,6 +61,31 @@ pub fn fit(line: &str, cols: usize) -> String {
         out.push_str(segment);
     }
     out
+}
+
+/// Cuts plain text to `max` columns keeping the start, marking the cut: `long-branch-na…`.
+pub fn fit_end(s: &str, max: usize) -> String {
+    match max {
+        _ if width(s) <= max => s.to_string(),
+        0 => String::new(),
+        _ => fit(s, max - 1) + "…",
+    }
+}
+
+/// Cuts plain text to `max` columns keeping the end, where file names live: `…/deep/file.rs`.
+pub fn fit_start(s: &str, max: usize) -> String {
+    match max {
+        _ if width(s) <= max => s.to_string(),
+        0 => String::new(),
+        _ => {
+            let mut used = 0;
+            let kept = s.char_indices().rev().take_while(|(_, c)| {
+                used += c.width().unwrap_or(0);
+                used < max
+            });
+            format!("…{}", &s[kept.last().map_or(s.len(), |(at, _)| at)..])
+        }
+    }
 }
 
 /// Splits the text into pieces of at most `cols` display columns. Each piece after the first
@@ -73,9 +99,8 @@ pub fn wrap(line: &str, cols: usize) -> Vec<String> {
     // Escapes in effect: SGR since the last reset, and an open OSC 8 link.
     let mut sgr = String::new();
     let mut link: Option<&str> = None;
-    for (segment, visible) in segments(line) {
-        if visible {
-            let w = segment.chars().next().and_then(|c| c.width()).unwrap_or(0);
+    for (segment, w) in segments(line) {
+        if let Some(w) = w {
             if used + w > cols && used > 0 {
                 pieces.push(std::mem::take(&mut piece));
                 piece.push_str(&sgr);
@@ -103,6 +128,15 @@ pub fn wrap(line: &str, cols: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_respects_display_width() {
+        assert_eq!(fit_end("feature/long-name", 8), "feature…");
+        assert_eq!(fit_start("src/deep/module/file.rs", 10), "…e/file.rs");
+        assert_eq!(fit_start("日本語のファイル.rs", 9), "…イル.rs");
+        assert_eq!(fit_end("short", 8), "short");
+        assert_eq!((fit_end("abc", 0), fit_start("abc", 0)), (String::new(), String::new()));
+    }
 
     #[test]
     fn counts_and_cuts_only_visible_columns() {

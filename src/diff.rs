@@ -87,22 +87,6 @@ impl CommitAt {
     }
 }
 
-/// The request file of the diff pane belonging to `sidebar_pane`.
-pub fn request_file(sidebar_pane: &str) -> PathBuf {
-    let name: String = sidebar_pane.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-    crate::state::state_dir().join("diff").join(format!("{name}.json"))
-}
-
-pub fn write_request(file: &Path, request: &DiffRequest) -> Result<()> {
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = file.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(request)?)?;
-    std::fs::rename(&tmp, file)?;
-    Ok(())
-}
-
 pub fn run() -> Result<()> {
     let file = PathBuf::from(std::env::var(ENV).with_context(|| format!("{ENV} not set"))?);
     let owner = std::env::var(OWNER_ENV).ok();
@@ -235,10 +219,8 @@ fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut Patches) -> Vec<St
 }
 
 fn local_patch(request: &DiffRequest, root: &Path) -> Result<String, String> {
-    let git = |args: &[&str]| Command::new("git").arg("-C").arg(root).args(args).stdin(Stdio::null()).output();
-    let has_head = git(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok_and(|o| o.status.success());
-    let args = diff_args(request, has_head);
-    let out = git(&args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| format!("git: {e}"))?;
+    let has_head = git::git_stdout(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_some();
+    let out = git::git(root).args(diff_args(request, has_head)).output().map_err(|e| format!("git: {e}"))?;
     let untracked = matches!(request, DiffRequest::Local { untracked: true, .. });
     // `--no-index` exits 1 when the files differ; other failures leave stdout empty.
     if out.stdout.is_empty() && !out.status.success() && !untracked {
@@ -269,12 +251,8 @@ fn fetched(patches: &mut Patches, url: &str, fetch: impl FnOnce() -> Result<Stri
 
 /// The user's `core.pager` (as seen from `repo`) when it is delta.
 fn delta_pager(repo: Option<&Path>) -> Option<String> {
-    let mut git = Command::new("git");
-    if let Some(repo) = repo {
-        git.arg("-C").arg(repo);
-    }
-    let out = git.args(["config", "--get", "core.pager"]).stdin(Stdio::null()).output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|p| p.contains("delta"))
+    let pager = git::git_stdout(repo.unwrap_or(Path::new(".")), &["config", "--get", "core.pager"])?;
+    Some(pager.trim().to_string()).filter(|p| p.contains("delta"))
 }
 
 /// Runs `patch` through the configured delta command at the pane's width, without paging.
@@ -325,34 +303,24 @@ fn colorize(patch: &str) -> String {
 /// Local changes: staged and unstaged together (`git diff HEAD`), untracked files as all-new;
 /// unpushed commits: what a push would add (`@{u}...HEAD`); a commit: `git show`, of one file
 /// or all.
-fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<String> {
-    if let DiffRequest::Commit { commit, path } = request {
-        let mut args: Vec<String> =
-            ["show", "--color=never", "--format=fuller", "--diff-merges=first-parent", "-M", commit.hash.as_str()]
-                .map(String::from)
-                .to_vec();
-        if let Some(path) = path {
-            args.extend(["--".into(), path.clone()]);
-        }
-        return args;
-    }
-    let mut args: Vec<String> = vec!["diff".into(), "--color=never".into()];
+fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<&str> {
     match request {
-        DiffRequest::Local { path, untracked: true, .. } => {
-            args.extend(["--no-index", "--", "/dev/null", path.as_str()].map(String::from));
-        }
+        DiffRequest::Local { path, untracked: true, .. } => vec!["diff", "--color=never", "--no-index", "--", "/dev/null", path.as_str()],
         DiffRequest::Local { path, orig, .. } => {
             // Before the first commit there is no HEAD: show what is staged.
-            args.extend([if has_head { "HEAD" } else { "--cached" }, "-M", "--"].map(String::from));
-            args.extend(orig.clone());
-            args.push(path.clone());
+            let mut args = vec!["diff", "--color=never", if has_head { "HEAD" } else { "--cached" }, "-M", "--"];
+            args.extend(orig.as_deref());
+            args.push(path);
+            args
         }
-        DiffRequest::Unpushed { path, .. } => {
-            args.extend(["-M", "@{u}...HEAD", "--", path.as_str()].map(String::from));
+        DiffRequest::Unpushed { path, .. } => vec!["diff", "--color=never", "-M", "@{u}...HEAD", "--", path.as_str()],
+        DiffRequest::Commit { commit, path } => {
+            let mut args = vec!["show", "--color=never", "--format=fuller", "--diff-merges=first-parent", "-M", commit.hash.as_str()];
+            args.extend(path.as_deref().into_iter().flat_map(|path| ["--", path]));
+            args
         }
-        DiffRequest::Pr { .. } | DiffRequest::Commit { .. } => return Vec::new(),
+        DiffRequest::Pr { .. } => unreachable!("a pull request's patch comes from GitHub"),
     }
-    args
 }
 
 /// Draws `lines` from the top and `hint`, dimmed and right-aligned, on the last row.
@@ -389,13 +357,19 @@ mod tests {
 
     #[test]
     fn diff_args_cover_tracked_renamed_untracked_and_unborn() {
-        let args = |r: &DiffRequest, head: bool| diff_args(r, head)[2..].to_vec();
+        let args = |r: &DiffRequest, head: bool| diff_args(r, head)[2..].iter().map(|a| a.to_string()).collect::<Vec<_>>();
         assert_eq!(args(&local("a.rs", None, false), true), ["HEAD", "-M", "--", "a.rs"]);
         assert_eq!(args(&local("new.rs", Some("old.rs"), false), true), ["HEAD", "-M", "--", "old.rs", "new.rs"]);
         assert_eq!(args(&local("n.md", None, true), true), ["--no-index", "--", "/dev/null", "n.md"]);
         assert_eq!(args(&local("a.rs", None, false), false), ["--cached", "-M", "--", "a.rs"]);
         let unpushed = DiffRequest::Unpushed { root: "/r".into(), path: "a.rs".into() };
         assert_eq!(args(&unpushed, true), ["-M", "@{u}...HEAD", "--", "a.rs"]);
+        let commit = |path: Option<&str>| DiffRequest::Commit {
+            commit: CommitAt { hash: "h1".into(), root: None, repo: None },
+            path: path.map(String::from),
+        };
+        assert_eq!(diff_args(&commit(None), true)[0], "show");
+        assert_eq!(args(&commit(Some("a.rs")), true)[3..], ["h1", "--", "a.rs"]);
     }
 
     #[test]

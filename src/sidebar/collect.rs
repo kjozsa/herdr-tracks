@@ -6,11 +6,11 @@ use crate::git::{self, Commit};
 use crate::github::{self, PrRef, PrView};
 use crate::herdr::{self, PaneInfo};
 use crate::repos;
-use crate::state::{self, PrRecord, RepoRecord, SessionRepos};
+use crate::state::{self, PrRecord, RepoRecord, SessionState};
 use crate::transcript::{Format, Touch, Transcript};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
 /// Pull-request statuses and commits fetched in the background for one chat.
@@ -50,7 +50,7 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
         None => (format!("terminal-{}", target.terminal_id), false),
     };
     let title = target.terminal_title_stripped.clone().or_else(|| target.agent.clone()).unwrap_or_default();
-    let switched = model.session.as_ref().map(|s| &s.repos.session) != Some(&key);
+    let switched = model.session.as_ref().map(|s| &s.saved.key) != Some(&key);
     let session = match &mut model.session {
         Some(session) if !switched => {
             session.pane_id = target.pane_id.clone();
@@ -58,11 +58,7 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
             session
         }
         slot => {
-            let repos = if persisted {
-                state::load_session(&key)
-            } else {
-                SessionRepos { session: key, ..SessionRepos::default() }
-            };
+            let saved = if persisted { state::load_session(&key) } else { SessionState { key, ..SessionState::default() } };
             let fallback_cwd = target.cwd.clone().map(PathBuf::from).unwrap_or_default();
             let transcript = target
                 .agent
@@ -73,7 +69,7 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
             slot.insert(Session {
                 pane_id: target.pane_id.clone(),
                 title,
-                repos,
+                saved,
                 persisted,
                 transcript,
                 links: Vec::new(),
@@ -93,13 +89,11 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
     }
     touches.extend(observed.into_iter().map(|path| Touch { path, writes: false, at: None }));
 
-    let SessionRepos { repos: records, prs, dismissed_repos, dismissed_links, .. } = &mut session.repos;
+    let saved = &mut session.saved;
     let mut dirty = false;
     // Newest first; mentioning a dismissed link again, after the dismissal, brings it back.
     for (url, at) in activity.links {
-        let before = dismissed_links.len();
-        dismissed_links.retain(|d| !(d.url == url && d.at < at));
-        dirty |= dismissed_links.len() != before;
+        dirty |= saved.revive_link(&url, at);
         session.links.retain(|l| *l != url);
         session.links.insert(0, url);
     }
@@ -110,18 +104,16 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
         // A tool call after the dismissal brings a dismissed repo back; the agent merely
         // sitting in it (process working dirs) does not.
         if let Some(at) = touch.at {
-            let before = dismissed_repos.len();
-            dismissed_repos.retain(|d| !(d.root == root && d.at < at));
-            dirty |= dismissed_repos.len() != before;
+            dirty |= saved.revive_repo(&root, at);
         }
-        match records.iter_mut().find(|r| r.root == root) {
+        match saved.repos.iter_mut().find(|r| r.root == root) {
             Some(record) if touch.writes && !record.changed => {
                 record.changed = true;
                 dirty = true;
             }
             Some(_) => {}
             None => {
-                records.push(RepoRecord { root, changed: touch.writes, baseline: None });
+                saved.repos.push(RepoRecord { root, changed: touch.writes, baseline: None });
                 dirty = true;
             }
         }
@@ -136,15 +128,15 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
         }
     }
     for pr in mentioned {
-        if !prs.iter().any(|r| r.pr.same(&pr)) {
-            prs.push(PrRecord { pr, root: None, status: None });
+        if !saved.prs.iter().any(|r| r.pr.same(&pr)) {
+            saved.prs.push(PrRecord { pr, root: None });
             dirty = true;
         }
     }
     // A PR belongs to the touched checkout whose remote is its repo, and is listed under it.
-    for pr in prs.iter_mut().filter(|p| p.root.is_none()) {
+    for pr in saved.prs.iter_mut().filter(|p| p.root.is_none()) {
         let slug = pr.pr.slug();
-        let owner = records.iter().find(|r| {
+        let owner = saved.repos.iter().find(|r| {
             model.remotes.entry(r.root.clone()).or_insert_with(|| github::remote_slugs(&r.root)).contains(&slug)
         });
         if let Some(record) = owner {
@@ -152,43 +144,34 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
             dirty = true;
         }
     }
-    if dirty && session.persisted {
-        state::save_session(&session.repos)?;
+    if dirty {
+        session.save()?;
     }
     Ok(switched || dirty)
 }
 
-pub(super) fn is_dismissed(repos: &SessionRepos, root: &Path) -> bool {
-    repos.dismissed_repos.iter().any(|d| d.root == root)
-}
-
-/// Pull requests still shown: not dismissed, and not under a dismissed repo.
-pub(super) fn visible_prs(repos: &SessionRepos) -> impl Iterator<Item = &PrRecord> {
-    repos.prs.iter().filter(|p| {
-        !repos.dismissed_prs.iter().any(|d| d.same(&p.pr)) && !p.root.as_ref().is_some_and(|root| is_dismissed(repos, root))
-    })
-}
-
+/// A shown PR neither fetched nor failed yet: fetched at once rather than with the next
+/// periodic refresh.
 pub(super) fn has_unfetched_pr(model: &Model) -> bool {
     model.session.as_ref().is_some_and(|s| {
-        visible_prs(&s.repos).any(|p| needs_fetch(model, p) && !model.pr_errors.contains_key(&p.pr.url()))
+        s.saved.visible_prs().any(|p| !model.pr_views.contains_key(&p.pr.url()) && !model.pr_errors.contains_key(&p.pr.url()))
     })
 }
 
-/// Open PRs change; any PR's commits are fetched once per sidebar (they are not persisted).
+/// A PR's status, title and commits are fetched until it is merged or closed: once per sidebar
+/// for those.
 fn needs_fetch(model: &Model, pr: &PrRecord) -> bool {
-    !pr.status.is_some_and(|s| s.state.is_final()) || !model.pr_views.contains_key(&pr.pr.url())
+    model.pr_views.get(&pr.pr.url()).is_none_or(|view| !view.status.state.is_final())
 }
 
-/// Fetches the status and commits of every PR in need (see [`needs_fetch`]) on a background
-/// thread.
+/// Fetches every shown PR in need (see [`needs_fetch`]) on a background thread.
 pub(super) fn start_pr_refresh(model: &Model) -> Option<Receiver<PrBatch>> {
     let session = model.session.as_ref()?;
-    let todo: Vec<PrRef> = visible_prs(&session.repos).filter(|p| needs_fetch(model, p)).map(|p| p.pr.clone()).collect();
+    let todo: Vec<PrRef> = session.saved.visible_prs().filter(|p| needs_fetch(model, p)).map(|p| p.pr.clone()).collect();
     if todo.is_empty() {
         return None;
     }
-    let key = session.repos.session.clone();
+    let key = session.saved.key.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let results = std::thread::scope(|scope| {
@@ -204,29 +187,23 @@ pub(super) fn start_pr_refresh(model: &Model) -> Option<Receiver<PrBatch>> {
     Some(rx)
 }
 
-pub(super) fn apply_prs(model: &mut Model, batch: PrBatch) -> Result<()> {
-    let Some(session) = model.session.as_mut().filter(|s| s.repos.session == batch.session) else { return Ok(()) };
-    let mut dirty = false;
+/// Takes in a batch fetched for the followed chat. A failure keeps the last view: the row
+/// shows what was fetched before.
+pub(super) fn apply_prs(model: &mut Model, batch: PrBatch) {
+    if model.session.as_ref().is_none_or(|s| s.saved.key != batch.session) {
+        return;
+    }
     for (pr, result) in batch.results {
         match result {
             Ok(view) => {
-                let status = view.status;
                 model.pr_errors.remove(&pr.url());
                 model.pr_views.insert(pr.url(), view);
-                if let Some(record) = session.repos.prs.iter_mut().find(|r| r.pr == pr && r.status != Some(status)) {
-                    record.status = Some(status);
-                    dirty = true;
-                }
             }
             Err(e) => {
                 model.pr_errors.insert(pr.url(), e);
             }
         }
     }
-    if dirty && session.persisted {
-        state::save_session(&session.repos)?;
-    }
-    Ok(())
 }
 
 /// Records each touched repo's fingerprint at first touch, and marks it changed once the
@@ -234,7 +211,7 @@ pub(super) fn apply_prs(model: &mut Model, batch: PrBatch) -> Result<()> {
 pub(super) fn track_changes(model: &mut Model) -> Result<()> {
     let Some(session) = &mut model.session else { return Ok(()) };
     let mut dirty = false;
-    for record in &mut session.repos.repos {
+    for record in &mut session.saved.repos {
         let Some(Ok(status)) = model.statuses.get(&record.root) else { continue };
         match record.baseline {
             None => record.baseline = Some(status.fingerprint),
@@ -243,8 +220,8 @@ pub(super) fn track_changes(model: &mut Model) -> Result<()> {
         }
         dirty = true;
     }
-    if dirty && session.persisted {
-        state::save_session(&session.repos)?;
+    if dirty {
+        session.save()?;
     }
     Ok(())
 }
@@ -257,7 +234,7 @@ pub(super) fn refresh_git(model: &Model) -> (Statuses, HashMap<PathBuf, Vec<Comm
     std::thread::scope(|scope| {
         // Repos deleted since they were touched stay recorded but are not shown.
         let jobs: Vec<_> = session
-            .repos
+            .saved
             .repos
             .iter()
             .map(|r| &r.root)
@@ -275,22 +252,53 @@ pub(super) fn refresh_git(model: &Model) -> (Statuses, HashMap<PathBuf, Vec<Comm
     })
 }
 
-/// When the chat was acting: its tool calls, finished or still running, merged where they
-/// overlap. Unix milliseconds.
+/// When the chat was acting: its tool calls, finished or still running (those up to now), in
+/// no particular order. Unix milliseconds.
 pub(super) fn call_windows(session: &Session, now: i64) -> Vec<(i64, i64)> {
     let running = session.transcript.iter().flat_map(Transcript::running).map(|start| (start, now.min(start + CALL_MAX_MS)));
-    let mut windows: Vec<(i64, i64)> = session.calls.iter().copied().chain(running).collect();
-    windows.sort_unstable();
-    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(windows.len());
-    for (start, end) in windows {
-        match merged.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
-        }
-    }
-    merged
+    session.calls.iter().copied().chain(running).collect()
 }
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::PrState;
+    use crate::sidebar::fixture::{fixture, pr, session, view};
+
+    #[test]
+    fn call_windows_are_the_chat_s_calls() {
+        let mut model = fixture(&[], &[]);
+        session(&mut model).calls = vec![(50, 60), (10, 20), (15, 30)];
+        assert_eq!(call_windows(session(&mut model), 100), [(50, 60), (10, 20), (15, 30)]);
+    }
+
+    #[test]
+    fn prs_are_fetched_until_merged_or_closed() {
+        let (open, merged, failed) = (pr("r", 1), pr("r", 2), pr("r", 3));
+        let mut model = fixture(&[], &[open.clone(), merged.clone(), failed.clone()]);
+        assert!(has_unfetched_pr(&model), "nothing fetched yet: fetch at once");
+        model.pr_views.insert(open.url(), view(PrState::Open, Vec::new()));
+        model.pr_views.insert(merged.url(), view(PrState::Merged, Vec::new()));
+        model.pr_errors.insert(failed.url(), "gh: offline".into());
+        assert!(!has_unfetched_pr(&model), "fetched or failed: left to the periodic refresh");
+        let saved = &model.session.as_ref().unwrap().saved;
+        let due: Vec<u32> = saved.visible_prs().filter(|p| needs_fetch(&model, p)).map(|p| p.pr.number).collect();
+        assert_eq!(due, [1, 3], "a merged PR does not change any more");
+    }
+
+    #[test]
+    fn a_failed_fetch_keeps_the_last_view() {
+        let mut model = fixture(&[], &[pr("r", 1)]);
+        let batch = |result| PrBatch { session: "s".into(), results: vec![(pr("r", 1), result)] };
+        apply_prs(&mut model, batch(Ok(view(PrState::Open, Vec::new()))));
+        apply_prs(&mut model, batch(Err("gh: offline".into())));
+        assert!(model.pr_views.contains_key(&pr("r", 1).url()));
+        assert_eq!(model.pr_errors.get(&pr("r", 1).url()).map(String::as_str), Some("gh: offline"));
+        apply_prs(&mut model, PrBatch { session: "another chat".into(), results: vec![(pr("r", 2), Err("x".into()))] });
+        assert!(!model.pr_errors.contains_key(&pr("r", 2).url()), "a batch of a chat no longer followed");
+    }
 }

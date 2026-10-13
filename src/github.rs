@@ -1,7 +1,7 @@
 //! GitHub pull requests: recognising PR URLs, matching them to local checkouts by remote,
 //! and reading state + CI rollup through the `gh` CLI.
 
-use crate::git::{FileChange, LineStat};
+use crate::git::{self, FileChange, LineStat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -59,19 +59,12 @@ pub fn pr_urls(text: &str) -> Vec<PrRef> {
 /// `owner/repo` (lowercased) of every github.com remote of the checkout at `root`. The first
 /// is the repo `gh` would default to: remotes named `upstream`, `github`, `origin`, then others.
 pub fn remote_slugs(root: &Path) -> Vec<String> {
-    let Ok(out) = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
-        .output()
-    else {
-        return Vec::new();
-    };
+    let Some(out) = git::git_stdout(root, &["config", "--get-regexp", r"^remote\..*\.url$"]) else { return Vec::new() };
     let rank = |key: &str| {
         let name = key.strip_prefix("remote.").and_then(|k| k.strip_suffix(".url")).unwrap_or(key);
         ["upstream", "github", "origin"].iter().position(|n| *n == name).unwrap_or(3)
     };
-    let mut remotes: Vec<(usize, String)> = String::from_utf8_lossy(&out.stdout)
+    let mut remotes: Vec<(usize, String)> = out
         .lines()
         .filter_map(|l| l.split_once(' '))
         .filter_map(|(key, url)| Some((rank(key), remote_slug(url.trim())?)))
@@ -89,7 +82,7 @@ fn remote_slug(url: &str) -> Option<String> {
     (!owner.is_empty() && !repo.is_empty() && !repo.contains('/')).then(|| format!("{owner}/{repo}").to_lowercase())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     Open,
     Draft,
@@ -98,20 +91,21 @@ pub enum PrState {
 }
 
 impl PrState {
-    /// Merged and closed PRs keep their last status and are not refreshed again.
+    /// Merged and closed PRs no longer change: a sidebar fetches them once.
     pub fn is_final(self) -> bool {
         matches!(self, PrState::Merged | PrState::Closed)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// CI rollup, worst last: failing beats pending beats passing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Checks {
     Passing,
-    Failing,
     Pending,
+    Failing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrStatus {
     pub state: PrState,
     /// `None` when the PR has no checks.
@@ -183,25 +177,19 @@ fn parse_status(json: &Value) -> PrStatus {
     PrStatus { state, checks: rollup(json["statusCheckRollup"].as_array().map(Vec::as_slice).unwrap_or_default()) }
 }
 
-/// Failing beats pending beats passing. Check runs report `status` + `conclusion`;
-/// commit statuses report `state`.
+/// The worst of the checks. Check runs report `status` + `conclusion`; commit statuses report
+/// `state`.
 fn rollup(checks: &[Value]) -> Option<Checks> {
-    let mut result = None;
-    for check in checks {
-        let one = match (check["status"].as_str(), check["conclusion"].as_str(), check["state"].as_str()) {
+    checks
+        .iter()
+        .map(|check| match (check["status"].as_str(), check["conclusion"].as_str(), check["state"].as_str()) {
             (_, Some("FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE"), _)
             | (_, _, Some("FAILURE" | "ERROR")) => Checks::Failing,
             (Some(status), _, _) if status != "COMPLETED" => Checks::Pending,
             (_, _, Some("PENDING" | "EXPECTED")) => Checks::Pending,
             _ => Checks::Passing,
-        };
-        result = Some(match (result, one) {
-            (Some(Checks::Failing), _) | (_, Checks::Failing) => Checks::Failing,
-            (Some(Checks::Pending), _) | (_, Checks::Pending) => Checks::Pending,
-            _ => Checks::Passing,
-        });
-    }
-    result
+        })
+        .max()
 }
 
 /// The files a commit of `slug` (`owner/repo`) changes, from GitHub.
@@ -242,8 +230,7 @@ pub fn pr_diff(url: &str) -> Result<String, String> {
 fn gh(args: &[&str]) -> Result<String, String> {
     let out = Command::new("gh").args(args).output().map_err(|e| format!("gh: {e}"))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err.lines().next().unwrap_or("gh failed").to_string());
+        return Err(git::first_stderr_line(&out, "gh failed"));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

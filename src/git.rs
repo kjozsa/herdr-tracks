@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// Untracked files larger than this are not read to count their lines.
 const COUNT_LIMIT: u64 = 4 << 20;
@@ -55,16 +55,12 @@ pub struct RepoStatus {
 }
 
 pub fn status(root: &Path) -> Result<RepoStatus, String> {
-    let out = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(root)
+    let out = git(root)
         .args(["-c", "core.quotePath=false", "status", "--porcelain=v2", "--branch"])
         .output()
         .map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err.lines().next().unwrap_or("git status failed").to_string());
+        return Err(first_stderr_line(&out, "git status failed"));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut status = parse(&text);
@@ -101,16 +97,8 @@ fn numstat(root: &Path, unborn: bool) -> HashMap<String, LineStat> {
 }
 
 fn diff_numstat(root: &Path, args: &[&str]) -> HashMap<String, LineStat> {
-    let out = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(root)
-        .args(["-c", "core.quotePath=false", "diff", "--numstat", "-z", "-M"])
-        .args(args)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    parse_numstat(&out)
+    let args = [&["-c", "core.quotePath=false", "diff", "--numstat", "-z", "-M"][..], args].concat();
+    parse_numstat(&git_stdout(root, &args).unwrap_or_default())
 }
 
 /// `git diff --numstat -z`: `added\tremoved\tpath\0`, or `added\tremoved\t\0old\0new\0` for
@@ -242,17 +230,9 @@ pub struct Commit {
 /// time: a rebase or cherry-pick within a window counts, a merged-in older commit does not.
 pub fn commits_within(root: &Path, windows: &[(i64, i64)]) -> Vec<Commit> {
     let Some(since) = windows.iter().map(|(start, _)| start / 1000 - 1).min() else { return Vec::new() };
-    let out = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(root)
-        .args(["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%ct%x1f%s"])
-        .arg(format!("--since=@{since}"))
-        .output();
-    match out {
-        Ok(out) if out.status.success() => parse_log(&String::from_utf8_lossy(&out.stdout), windows),
-        _ => Vec::new(),
-    }
+    let since = format!("--since=@{since}");
+    let log = git_stdout(root, &["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%ct%x1f%s", &since]);
+    log.map_or_else(Vec::new, |text| parse_log(&text, windows))
 }
 
 fn parse_log(text: &str, windows: &[(i64, i64)]) -> Vec<Commit> {
@@ -315,9 +295,23 @@ fn parse_name_status(text: &str) -> Vec<(char, String)> {
     files
 }
 
-fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("--no-optional-locks").arg("-C").arg(root).args(args).output().ok()?;
+/// `git -C <root>`, taking no optional locks: a git command of the user's running meanwhile
+/// does not find the index locked.
+pub(crate) fn git(root: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.arg("--no-optional-locks").arg("-C").arg(root);
+    git
+}
+
+/// What the git command prints, when it succeeds.
+pub(crate) fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+    let out = git(root).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The first line a failed command wrote to stderr, or `fallback` when it wrote none.
+pub(crate) fn first_stderr_line(out: &Output, fallback: &str) -> String {
+    String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or(fallback).to_string()
 }
 
 #[cfg(test)]

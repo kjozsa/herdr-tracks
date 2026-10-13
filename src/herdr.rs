@@ -1,23 +1,70 @@
-//! Minimal newline-delimited JSON client for the herdr socket API (Linux: Unix socket).
+//! Minimal newline-delimited JSON client for the herdr socket API (Linux: Unix socket), and
+//! where herdr keeps its socket, session and config.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn socket_path() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("HERDR_SOCKET_PATH") {
-        return Ok(PathBuf::from(p));
-    }
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
-    Ok(PathBuf::from(home).join(".config/herdr/herdr.sock"))
+/// herdr's defaults for `[ui] sidebar_width`, `sidebar_min_width`, `sidebar_max_width`.
+const DEFAULT_WIDTH: u32 = 26;
+const DEFAULT_MIN_WIDTH: u32 = 18;
+const DEFAULT_MAX_WIDTH: u32 = 36;
+
+/// `$XDG_CONFIG_HOME/herdr`, else `~/.config/herdr`.
+fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+        .join("herdr")
+}
+
+fn config_path() -> PathBuf {
+    std::env::var_os("HERDR_CONFIG_PATH").map(PathBuf::from).unwrap_or_else(|| config_dir().join("config.toml"))
+}
+
+/// The session's socket; the default session's lives in the config dir.
+fn socket_path() -> PathBuf {
+    std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from).unwrap_or_else(|| config_dir().join("herdr.sock"))
+}
+
+/// Directory holding the session's socket and `session.json` (named sessions have their own).
+fn runtime_dir() -> PathBuf {
+    socket_path().parent().map_or_else(config_dir, Path::to_path_buf)
+}
+
+/// herdr's left sidebar width: the live value from `session.json` (a dragged width), else
+/// `[ui] sidebar_width`, clamped to `[ui] sidebar_min_width..=sidebar_max_width` as herdr does.
+pub fn sidebar_width() -> u32 {
+    let live = std::fs::read(runtime_dir().join("session.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["sidebar_width"].as_u64())
+        .and_then(|w| u32::try_from(w).ok());
+    let ui = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|cfg| cfg.get("ui")?.as_table().cloned());
+    resolve_width(live, ui.as_ref())
+}
+
+fn resolve_width(live: Option<u32>, ui: Option<&toml::Table>) -> u32 {
+    let setting = |key: &str, default: u32| {
+        ui.and_then(|t| t.get(key)?.as_integer())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    let min = setting("sidebar_min_width", DEFAULT_MIN_WIDTH);
+    let max = setting("sidebar_max_width", DEFAULT_MAX_WIDTH).max(min);
+    live.filter(|w| *w > 0).unwrap_or_else(|| setting("sidebar_width", DEFAULT_WIDTH)).clamp(min, max)
 }
 
 /// Sends one request and returns its `result` object.
 pub fn call(method: &str, params: Value) -> Result<Value> {
-    let path = socket_path()?;
+    let path = socket_path();
     let mut stream =
         UnixStream::connect(&path).with_context(|| format!("connecting {}", path.display()))?;
     let mut line = serde_json::to_vec(&json!({"id": "tracks", "method": method, "params": params}))?;
@@ -178,4 +225,21 @@ pub fn open_plugin_pane(
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow!("plugin.pane.open reply has no pane id: {r}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_follows_herdr_clamping() {
+        let ui = |text: &str| text.parse::<toml::Table>().unwrap();
+        assert_eq!(resolve_width(None, None), DEFAULT_WIDTH);
+        let forced = ui("sidebar_width = 50\nsidebar_min_width = 50\nsidebar_max_width = 100");
+        assert_eq!(resolve_width(None, Some(&forced)), 50);
+        assert_eq!(resolve_width(Some(80), Some(&forced)), 80, "a dragged width wins within bounds");
+        assert_eq!(resolve_width(None, Some(&ui("sidebar_min_width = 50"))), 50, "minimum lifts the default width");
+        assert_eq!(resolve_width(None, Some(&ui("sidebar_width = 60"))), DEFAULT_MAX_WIDTH, "default maximum caps it");
+        assert_eq!(resolve_width(Some(10), None), DEFAULT_MIN_WIDTH);
+    }
 }
