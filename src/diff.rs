@@ -34,8 +34,8 @@ const WHEEL_LINES: usize = 3;
 pub enum DiffRequest {
     /// A changed file in a local checkout: staged and unstaged changes together.
     Local { root: PathBuf, path: String, orig: Option<String>, untracked: bool },
-    /// What the unpushed commits change in one file of a local checkout (`@{u}...HEAD`).
-    Unpushed { root: PathBuf, path: String },
+    /// Every uncommitted change of a local checkout, untracked files included.
+    Worktree { root: PathBuf },
     /// A commit, its message and what it changes (a merge: against its first parent, i.e.
     /// what it brought in); or one file of it.
     Commit { commit: CommitAt, path: Option<String> },
@@ -199,7 +199,8 @@ fn layout(lines: &[String], wrap: bool, cols: u16) -> (Vec<String>, Vec<usize>) 
 /// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
 fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut Patches) -> Vec<String> {
     let (patch, repo) = match request {
-        DiffRequest::Local { root, .. } | DiffRequest::Unpushed { root, .. } => (local_patch(request, root), Some(root.as_path())),
+        DiffRequest::Local { root, .. } => (local_patch(request, root), Some(root.as_path())),
+        DiffRequest::Worktree { root } => (worktree_patch(root), Some(root.as_path())),
         DiffRequest::Commit { commit, path } => match commit.local() {
             Some(root) => (local_patch(request, root), Some(root)),
             None => (remote_commit_patch(patches, commit, path.as_deref()), None),
@@ -227,6 +228,18 @@ fn local_patch(request: &DiffRequest, root: &Path) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Every uncommitted change of a checkout: tracked files against HEAD, then untracked files as
+/// all-new.
+fn worktree_patch(root: &Path) -> Result<String, String> {
+    let mut patch = local_patch(&DiffRequest::Worktree { root: root.to_path_buf() }, root)?;
+    let untracked = git::git_stdout(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        let file = DiffRequest::Local { root: root.to_path_buf(), path: path.into(), orig: None, untracked: true };
+        patch.push_str(&local_patch(&file, root)?);
+    }
+    Ok(patch)
 }
 
 /// A commit from GitHub, or one file of it.
@@ -301,19 +314,19 @@ fn colorize(patch: &str) -> String {
 }
 
 /// Local changes: staged and unstaged together (`git diff HEAD`), untracked files as all-new;
-/// unpushed commits: what a push would add (`@{u}...HEAD`); a commit: `git show`, of one file
-/// or all.
+/// a commit: `git show`, of one file or all.
 fn diff_args(request: &DiffRequest, has_head: bool) -> Vec<&str> {
+    // Before the first commit there is no HEAD: show what is staged.
+    let base = if has_head { "HEAD" } else { "--cached" };
     match request {
         DiffRequest::Local { path, untracked: true, .. } => vec!["diff", "--color=never", "--no-index", "--", "/dev/null", path.as_str()],
         DiffRequest::Local { path, orig, .. } => {
-            // Before the first commit there is no HEAD: show what is staged.
-            let mut args = vec!["diff", "--color=never", if has_head { "HEAD" } else { "--cached" }, "-M", "--"];
+            let mut args = vec!["diff", "--color=never", base, "-M", "--"];
             args.extend(orig.as_deref());
             args.push(path);
             args
         }
-        DiffRequest::Unpushed { path, .. } => vec!["diff", "--color=never", "-M", "@{u}...HEAD", "--", path.as_str()],
+        DiffRequest::Worktree { .. } => vec!["diff", "--color=never", base, "-M"],
         DiffRequest::Commit { commit, path } => {
             let mut args = vec!["show", "--color=never", "--format=fuller", "--diff-merges=first-parent", "-M", commit.hash.as_str()];
             args.extend(path.as_deref().into_iter().flat_map(|path| ["--", path]));
@@ -362,8 +375,6 @@ mod tests {
         assert_eq!(args(&local("new.rs", Some("old.rs"), false), true), ["HEAD", "-M", "--", "old.rs", "new.rs"]);
         assert_eq!(args(&local("n.md", None, true), true), ["--no-index", "--", "/dev/null", "n.md"]);
         assert_eq!(args(&local("a.rs", None, false), false), ["--cached", "-M", "--", "a.rs"]);
-        let unpushed = DiffRequest::Unpushed { root: "/r".into(), path: "a.rs".into() };
-        assert_eq!(args(&unpushed, true), ["-M", "@{u}...HEAD", "--", "a.rs"]);
         let commit = |path: Option<&str>| DiffRequest::Commit {
             commit: CommitAt { hash: "h1".into(), root: None, repo: None },
             path: path.map(String::from),

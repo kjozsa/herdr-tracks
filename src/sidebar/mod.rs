@@ -124,8 +124,8 @@ enum Click {
     File { root: PathBuf, change: Change },
     /// A pull request; expands to its commits.
     Pr { url: String },
-    /// A file changed by commits not yet pushed.
-    Unpushed { root: PathBuf, path: String },
+    /// A repo header: all its uncommitted changes.
+    Repo { root: PathBuf },
     /// A commit, listed on its own or (`under`) in an expanded pull request; expands to its
     /// files.
     Commit { commit: CommitAt, under: Option<String> },
@@ -138,7 +138,7 @@ enum Click {
 enum Key {
     File(PathBuf, String),
     Pr(String),
-    Unpushed(PathBuf, String),
+    Repo(PathBuf),
     Commit(String),
     CommitFile(String, String),
 }
@@ -148,7 +148,7 @@ impl Click {
         match self {
             Click::File { root, change } => Key::File(root.clone(), change.path.clone()),
             Click::Pr { url } => Key::Pr(url.clone()),
-            Click::Unpushed { root, path } => Key::Unpushed(root.clone(), path.clone()),
+            Click::Repo { root } => Key::Repo(root.clone()),
             Click::Commit { commit, .. } => Key::Commit(commit.hash.clone()),
             Click::CommitFile { commit, path } => Key::CommitFile(commit.hash.clone(), path.clone()),
         }
@@ -158,7 +158,7 @@ impl Click {
         match self {
             Click::File { root, change } => DiffRequest::local(root, change),
             Click::Pr { url } => DiffRequest::Pr { url: url.clone() },
-            Click::Unpushed { root, path } => DiffRequest::Unpushed { root: root.clone(), path: path.clone() },
+            Click::Repo { root } => DiffRequest::Worktree { root: root.clone() },
             Click::Commit { commit, .. } => DiffRequest::Commit { commit: commit.clone(), path: None },
             Click::CommitFile { commit, path } => DiffRequest::Commit { commit: commit.clone(), path: Some(path.clone()) },
         }
@@ -593,7 +593,7 @@ mod fixture {
 
     /// A clean checkout of `main`.
     pub(super) fn clean() -> RepoStatus {
-        RepoStatus { branch: "main".into(), ahead: 0, behind: 0, changes: Vec::new(), unpushed: Vec::new(), fingerprint: 0 }
+        RepoStatus { branch: "main".into(), ahead: 0, behind: 0, changes: Vec::new(), fingerprint: 0 }
     }
 
     /// Following a chat (not persisted) that changed the repos named (each [`root`], a
@@ -643,6 +643,8 @@ mod tests {
         let mut model = fixture(&["app"], &[pr("app", 7)]);
         model.statuses.insert(root("app"), Ok(RepoStatus { changes: vec![change("a.rs"), change("b.rs")], ..clean() }));
         let screen = render(&model, 40);
+        // The repo header comes first: it shows all uncommitted changes.
+        assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::Worktree { root: root("app") }));
         assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::local(&root("app"), &change("a.rs"))));
         move_selection(&mut model, &screen, 1);
         assert_eq!(model.selected, Some(Key::File(root("app"), "b.rs".into())));

@@ -166,22 +166,20 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
         if !rows.is_empty() {
             rows.push(Row::default());
         }
-        rows.push(Row { menu: Some(Target::Repo(root.clone())), ..Row::new(repo_header(root, model.statuses.get(root), cols)) });
+        // The header shows all uncommitted changes at once.
+        let header = repo_header(root, model.statuses.get(root), cols);
+        rows.push(Row { menu: Some(Target::Repo(root.clone())), click: Some(Click::Repo { root: root.clone() }), ..Row::new(header) });
         // Uncommitted work first: it is the freshest.
         match model.statuses.get(root) {
             None => {}
             Some(Err(e)) => rows.push(fitted(&format!(" ! {e}"), Tone::Error, cols)),
             Some(Ok(s)) => {
-                // Uncommitted changes (two-letter `git status` codes), then what unpushed
-                // commits change (`↑`).
+                // Uncommitted changes (two-letter `git status` codes); committed work is listed
+                // as commits, not files.
                 for change in &s.changes {
                     let code = String::from_utf8_lossy(&change.code).into_owned();
                     let line = file_row(" ", (code, change_tone(change.code)), &change.display(), change.stat, cols);
                     rows.push(Row { click: Some(Click::File { root: root.clone(), change: change.clone() }), ..Row::new(line) });
-                }
-                for (path, stat) in &s.unpushed {
-                    let line = file_row(" ", ("↑ ".into(), Tone::Branch), path, Some(*stat), cols);
-                    rows.push(Row { click: Some(Click::Unpushed { root: root.clone(), path: path.clone() }), ..Row::new(line) });
                 }
             }
         }
@@ -621,8 +619,9 @@ mod tests {
     use crate::git::{Change, FileChange};
     use crate::sidebar::fixture::{clean, fixture, gh, pr, root, session, text, view};
 
+    /// Selectable rows under the repo headers.
     fn keys(screen: &Screen) -> Vec<Key> {
-        screen.clicks().map(|(_, click)| click.key()).collect()
+        screen.clicks().map(|(_, click)| click.key()).filter(|key| !matches!(key, Key::Repo(_))).collect()
     }
 
     fn row<'a>(screen: &'a Screen, key: &Key) -> &'a Row {
@@ -647,16 +646,15 @@ mod tests {
     }
 
     #[test]
-    fn unpushed_files_are_rows_after_the_uncommitted_ones() {
+    fn the_header_shows_all_uncommitted_changes_and_only_those_are_file_rows() {
         let mut model = fixture(&["e2e"], &[]);
         let changes = vec![Change { code: *b" M", path: "a.py".into(), orig: None, stat: None }];
-        let unpushed = vec![("e2e/b.py".into(), LineStat::Lines { added: 4, removed: 1 })];
-        model.statuses.insert(root("e2e"), Ok(RepoStatus { changes, unpushed, ..clean() }));
+        model.statuses.insert(root("e2e"), Ok(RepoStatus { changes, ahead: 2, ..clean() }));
+        model.commits.insert(root("e2e"), commits(2));
         let screen = render(&model, 40);
-        let unpushed = Key::Unpushed(root("e2e"), "e2e/b.py".into());
-        assert_eq!(keys(&screen), [Key::File(root("e2e"), "a.py".into()), unpushed.clone()]);
-        let diff = row(&screen, &unpushed).click.as_ref().unwrap().diff_request();
-        assert_eq!(diff, DiffRequest::Unpushed { root: root("e2e"), path: "e2e/b.py".into() });
+        let header = row(&screen, &Key::Repo(root("e2e"))).click.as_ref().unwrap();
+        assert_eq!(header.diff_request(), DiffRequest::Worktree { root: root("e2e") });
+        assert_eq!(keys(&screen), [Key::File(root("e2e"), "a.py".into()), Key::Commit("h1".into()), Key::Commit("h0".into())]);
     }
 
     #[test]
@@ -800,7 +798,7 @@ mod tests {
         let mut scroll = 0;
         let view = window(&screen, 40, 5, &mut scroll, None);
         assert_eq!(view.rows.len(), 5);
-        assert_eq!(shown_keys(&view), [Key::File(root("app"), "a.rs".into())], "the last row counts the rest");
+        assert_eq!(shown_keys(&view), [Key::Repo(root("app")), Key::File(root("app"), "a.rs".into())], "the last row counts the rest");
 
         // Selecting the last row scrolls it into view; the highlight follows the scroll.
         let pr_key = Key::Pr(pr("app", 7).url());
@@ -808,10 +806,11 @@ mod tests {
         assert_eq!(scroll, 2);
         let highlight = view.highlight.unwrap();
         assert_eq!(view.rows[highlight].click.as_ref().map(Click::key), Some(pr_key));
-        assert_eq!(shown_keys(&view)[0], Key::File(root("app"), "a.rs".into()));
+        assert_eq!(shown_keys(&view)[0], Key::Repo(root("app")), "scrolled past the title and blank");
         // A pull request row stands for its URL; a repo header doesn't.
         assert_eq!(view.rows[highlight].url(), Some(pr("app", 7).url().as_str()));
-        assert_eq!(view.rows[0].url(), None);
+        let header = screen.row_of(Some(&Key::Repo(root("app")))).unwrap();
+        assert_eq!(screen.rows[header].url(), None);
     }
 
     #[test]

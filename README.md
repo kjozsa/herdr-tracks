@@ -2,14 +2,13 @@
 
 A [herdr](https://herdr.dev) plugin that docks a sidebar on the right of every tab running a
 coding agent and shows the tracks the agent's chat leaves behind: the git repos it changed,
-their uncommitted and unpushed files with line counts, the commits it made, and the pull
-requests it opened or is working on. Select a file or commit to see its diff next to the agent.
+their uncommitted files with line counts, the pull requests it opened or is working on, and
+the commits it made. Select a file, pull request or commit to see its diff next to the agent.
 
 ```
 herdr-tracks main ↑1
   M src/sidebar.rs                     +268 -105
  ?? src/ansi.rs                              +80
- ↑  src/git.rs                           +32 -15
  ▾ PR#42 open ✓ dock the sidebar
    ▸ 9e1c2a4 dock the sidebar on the right
  ▾ 3326d43 list pull requests newest first
@@ -41,10 +40,9 @@ The sidebar follows the focused agent pane of its tab and lists, per repo:
 
 | Row | Meaning |
 |---|---|
-| `herdr-tracks main ↑1 ↓2` | Repo, checked-out branch, commits ahead of / behind its upstream |
+| `herdr-tracks main ↑1 ↓2` | Repo, checked-out branch, commits ahead of / behind its upstream; select it to see all its uncommitted changes in one diff |
 | ` ▸ PR#42 open ✓ dock the sidebar` | A pull request the chat opened or referred to: state, CI checks (`✓` all pass, `✗` one failed, `◔` still running; none when the PR has no checks) and title; expands into its commits |
 | `  M`, `A `, `??` … | Uncommitted changes, as in `git status`, with lines added/removed |
-| ` ↑ ` | Files changed by commits not pushed yet |
 | ` ▸ 3326d43 …` | A commit; expands into the files it changes. Green marker: the chat made it |
 
 Under each repo, uncommitted work comes first, then pull requests and the chat's other commits

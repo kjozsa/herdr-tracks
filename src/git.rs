@@ -46,9 +46,6 @@ pub struct RepoStatus {
     pub ahead: u32,
     pub behind: u32,
     pub changes: Vec<Change>,
-    /// Files changed by commits not yet pushed to the upstream branch, with line counts:
-    /// what a push would add (`@{u}...HEAD`). Empty without an upstream.
-    pub unpushed: Vec<(String, LineStat)>,
     /// Hash of HEAD plus every status entry (with index blob ids). Upstream tracking is left
     /// out, so fetches and pushes do not count as local changes.
     pub fingerprint: u64,
@@ -67,11 +64,6 @@ pub fn status(root: &Path) -> Result<RepoStatus, String> {
     let stats = numstat(root, text.contains("# branch.oid (initial)"));
     for change in &mut status.changes {
         change.stat = if change.untracked() { count_lines(&root.join(&change.path)) } else { stats.get(&change.path).copied() };
-    }
-    if status.ahead > 0 && text.contains("# branch.upstream ") {
-        let mut unpushed: Vec<_> = diff_numstat(root, &["@{u}...HEAD"]).into_iter().collect();
-        unpushed.sort_by(|(a, _), (b, _)| a.cmp(b));
-        status.unpushed = unpushed;
     }
     Ok(status)
 }
@@ -148,7 +140,6 @@ fn parse(text: &str) -> RepoStatus {
         ahead: 0,
         behind: 0,
         changes: Vec::new(),
-        unpushed: Vec::new(),
         fingerprint: FNV_OFFSET,
     };
     for line in text.lines() {
