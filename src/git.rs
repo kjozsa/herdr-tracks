@@ -1,6 +1,6 @@
 //! `git status --porcelain=v2 --branch` for one checkout, with per-file line counts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -214,6 +214,9 @@ pub struct Commit {
     /// Committer time, unix seconds.
     pub time: i64,
     pub subject: String,
+    /// Whether the checkout's HEAD reaches it: worktrees share branches, so each lists the
+    /// commits of the others too.
+    pub on_head: bool,
 }
 
 /// Commits on any branch, remote branch or tag (or a detached HEAD) committed within one of
@@ -222,24 +225,44 @@ pub struct Commit {
 pub fn commits_within(root: &Path, windows: &[(i64, i64)]) -> Vec<Commit> {
     let Some(since) = windows.iter().map(|(start, _)| start / 1000 - 1).min() else { return Vec::new() };
     let since = format!("--since=@{since}");
-    let log = git_stdout(root, &["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%ct%x1f%s", &since]);
-    log.map_or_else(Vec::new, |text| parse_log(&text, windows))
+    let Some(log) = git_stdout(root, &["log", "HEAD", "--branches", "--remotes", "--tags", "--format=%H%x1f%ct%x1f%s", &since]) else {
+        return Vec::new();
+    };
+    // An unborn HEAD reaches nothing.
+    let head = git_stdout(root, &["rev-list", "HEAD", &since]).unwrap_or_default();
+    parse_log(&log, &head, windows)
 }
 
-fn parse_log(text: &str, windows: &[(i64, i64)]) -> Vec<Commit> {
-    // Git keeps whole seconds: allow one on either side of a window.
-    let within = |time: i64| windows.iter().any(|(start, end)| time * 1000 >= start - 1000 && time * 1000 <= end + 1000);
-    let mut commits: Vec<Commit> = text
+/// `log`: `hash␟time␟subject` lines; `head`: the hashes HEAD reaches, one per line.
+fn parse_log(log: &str, head: &str, windows: &[(i64, i64)]) -> Vec<Commit> {
+    let head: HashSet<&str> = head.lines().collect();
+    let mut commits: Vec<Commit> = log
         .lines()
         .filter_map(|line| {
             let mut fields = line.splitn(3, '\x1f');
             let (hash, time) = (fields.next()?, fields.next()?.parse().ok()?);
-            Some(Commit { hash: hash.into(), time, subject: fields.next().unwrap_or_default().into() })
+            let subject = fields.next().unwrap_or_default().into();
+            Some(Commit { hash: hash.into(), time, subject, on_head: head.contains(hash) })
         })
-        .filter(|c| within(c.time))
+        .filter(|c| within(windows, c.time * 1000))
         .collect();
     commits.sort_by_key(|c| std::cmp::Reverse(c.time));
     commits
+}
+
+/// Whether `ms` falls in one of `windows`, give or take a second: git keeps whole seconds.
+fn within(windows: &[(i64, i64)], ms: i64) -> bool {
+    windows.iter().any(|(start, end)| ms >= start - 1000 && ms <= end + 1000)
+}
+
+/// Whether one of the uncommitted files was last written within one of `windows`: catches
+/// changes a shell command made before anyone watched the repo (a chat imported into herdr).
+pub fn written_within(root: &Path, status: &RepoStatus, windows: &[(i64, i64)]) -> bool {
+    let modified = |path: &str| -> Option<i64> {
+        let time = std::fs::symlink_metadata(root.join(path)).ok()?.modified().ok()?;
+        Some(time.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64)
+    };
+    status.changes.iter().filter_map(|c| modified(&c.path)).any(|ms| within(windows, ms))
 }
 
 /// A file a commit changes.
@@ -325,9 +348,9 @@ mod tests {
         ]
         .join("\n");
         // Two calls: 989.5–995 s and 999–1000.2 s.
-        let commits = parse_log(&log, &[(989_500, 995_000), (999_000, 1_000_200)]);
-        let shown: Vec<(&str, &str)> = commits.iter().map(|c| (c.hash.as_str(), c.subject.as_str())).collect();
-        assert_eq!(shown, [("a1", "merge the feature"), ("c3", "fix: a | b")], "newest first, outside windows left out");
+        let commits = parse_log(&log, "c3\nb2\n", &[(989_500, 995_000), (999_000, 1_000_200)]);
+        let shown: Vec<(&str, &str, bool)> = commits.iter().map(|c| (c.hash.as_str(), c.subject.as_str(), c.on_head)).collect();
+        assert_eq!(shown, [("a1", "merge the feature", false), ("c3", "fix: a | b", true)], "newest first, outside windows left out");
     }
 
     const BASE: &str = "# branch.oid 1111\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -1\n";
@@ -353,6 +376,26 @@ mod tests {
         );
         assert_eq!((s.changes[1].path.as_str(), s.changes[1].orig.as_deref()), ("new.rs", Some("old.rs")));
         assert_eq!(parse("# branch.oid (initial)\n# branch.head (detached)\n").branch, "detached");
+    }
+
+    #[test]
+    fn files_written_during_a_call_count_older_ones_do_not() {
+        let root = std::env::temp_dir().join(format!("tracks-written-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let at = |name: &str, secs: u64| {
+            let file = std::fs::File::create(root.join(name)).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+        };
+        at("old.md", 100);
+        at("new.yml", 500);
+        let status = |paths: &[&str]| RepoStatus {
+            changes: paths.iter().map(|p| Change { code: *b" M", path: p.to_string(), orig: None, stat: None }).collect(),
+            ..parse("")
+        };
+        let windows = [(499_500, 499_800)];
+        assert!(!written_within(&root, &status(&["old.md", "gone.txt"]), &windows), "untouched or deleted");
+        assert!(written_within(&root, &status(&["old.md", "new.yml"]), &windows), "written just after the call ended");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

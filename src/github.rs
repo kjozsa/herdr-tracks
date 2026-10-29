@@ -117,6 +117,8 @@ pub struct PrStatus {
 pub struct PrView {
     pub status: PrStatus,
     pub title: String,
+    /// Its head branch.
+    pub head: String,
     /// Its commits, oldest first as GitHub lists them.
     pub commits: Vec<PrCommit>,
     /// The merge commit once merged (with a squash merge, the only one on the base branch).
@@ -142,7 +144,7 @@ impl PrView {
 }
 
 pub fn pr_view(pr: &PrRef) -> Result<PrView, String> {
-    let fields = "state,isDraft,statusCheckRollup,title,commits,mergeCommit,mergedAt,updatedAt";
+    let fields = "state,isDraft,statusCheckRollup,title,headRefName,commits,mergeCommit,mergedAt,updatedAt";
     let json = gh(&["pr", "view", &pr.url(), "--json", fields])?;
     let json: Value = serde_json::from_str(&json).map_err(|e| format!("gh output: {e}"))?;
     Ok(parse_view(&json))
@@ -161,6 +163,7 @@ fn parse_view(json: &Value) -> PrView {
     PrView {
         status: parse_status(json),
         title: json["title"].as_str().unwrap_or_default().to_string(),
+        head: json["headRefName"].as_str().unwrap_or_default().to_string(),
         commits: commits.collect(),
         merge,
         updated: secs(&json["updatedAt"]),
@@ -296,6 +299,7 @@ mod tests {
     fn pr_view_holds_its_commits_and_merge_commit() {
         let view = parse_view(&json!({
             "state": "MERGED",
+            "headRefName": "feature/x",
             "commits": [{"oid": "a1", "messageHeadline": "first", "committedDate": "2026-10-13T07:04:58Z"}],
             "mergeCommit": {"oid": "m9"},
             "mergedAt": "2026-10-13T09:35:45Z",
@@ -304,6 +308,7 @@ mod tests {
         assert_eq!(view.commits, [PrCommit { oid: "a1".into(), subject: Some("first".into()), time: Some(1_791_875_098) }]);
         assert_eq!(view.merge, Some(PrCommit { oid: "m9".into(), subject: None, time: Some(1_791_884_145) }));
         assert!(view.holds("a1") && view.holds("m9") && !view.holds("zz"));
+        assert_eq!(view.head, "feature/x");
         assert_eq!(view.updated, Some(1_791_884_146));
     }
 

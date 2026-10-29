@@ -56,8 +56,17 @@ A commit counts as the chat's when it was committed while one of the chat's tool
 its own commits, merges and rebases, and pull requests it merged on GitHub; not older commits
 a merge brought in. Commits on any local or remote branch count, pushed or not.
 
-A repo is listed once the chat **changed** it: edited or wrote a file there, committed, or the
-repo's git state moved after the chat first touched it. Repos the chat only read are not
+Several checkouts of one repo (git worktrees share their branches) list each pull request and
+commit once. A pull request goes under the checkout that has its branch checked out, otherwise
+under the first one the chat touched. A commit goes inside the pull request that holds it,
+otherwise under the checkout whose branch has it. A rebased or cherry-picked commit can leave its
+old copy on a branch no checkout has out. That copy is not listed when a pull request holds a
+commit of the chat's with the same subject.
+
+A repo is listed once the chat **changed** it: edited or wrote a file there, committed, the
+repo's git state moved after the chat first touched it, or one of its uncommitted files was
+last written while one of the chat's tool calls ran (shell edits in a chat begun outside
+herdr). Repos the chat only read are not
 listed, unless one of its pull requests belongs to them. Pull requests are those the chat
 created with `gh pr create`, or referred to: a pull request URL in your message, omp's `pr://`
 reads, or `gh pr view/diff/checkout/review/…`.
@@ -92,6 +101,9 @@ In the sidebar:
 In the diff pane: `↓` `↑`, PgDn/PgUp, space/`b`, `g`/`G`, mouse wheel; `w` wraps long lines (again
 to cut them at the edge); `q` or `Esc` closes it.
 Diffs are formatted with [delta](https://github.com/dandavison/delta) when it is your git pager.
+An open diff of uncommitted changes updates within a second of an edit or commit, keeping its
+scroll position. A pull request's diff updates within 30 seconds of a push. A commit's diff
+never changes: amending makes a new commit, listed as its own row.
 
 A dismissed repo returns when the chat touches it again, a dismissed link when the chat
 mentions it again; a dismissed pull request stays hidden for that chat. The sidebar cannot be

@@ -27,6 +27,9 @@ const POLL: Duration = Duration::from_millis(50);
 const OWNER_CHECK: Duration = Duration::from_secs(1);
 /// How long a patch fetched from GitHub is reused before fetching it again.
 const FETCHED_TTL: Duration = Duration::from_secs(30);
+/// How often the viewer reads an uncommitted change or a pull request again, to follow edits,
+/// commits and pushes (a pull request is fetched again once per [`FETCHED_TTL`]).
+const REFRESH: Duration = Duration::from_secs(1);
 const WHEEL_LINES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +47,11 @@ pub enum DiffRequest {
 }
 
 impl DiffRequest {
+    /// Whether what it shows can change: a commit cannot (amending one makes another).
+    fn changes(&self) -> bool {
+        !matches!(self, DiffRequest::Commit { .. })
+    }
+
     pub fn local(root: &Path, change: &Change) -> Self {
         DiffRequest::Local {
             root: root.to_path_buf(),
@@ -104,12 +112,16 @@ pub fn run() -> Result<()> {
 /// they were fetched.
 type Patches = HashMap<String, (Instant, Result<String, String>)>;
 
-/// Shows the requested diff until `q`/`Esc`, re-rendering when the request or width changes.
-/// `w` wraps long lines, or cuts them at the edge again. Also ends once `owner` (the sidebar
+/// Shows the requested diff until `q`/`Esc`, re-rendering when the request or width changes,
+/// or when the patch does (read again every [`REFRESH`]; the scroll stays). `w` wraps long lines, or cuts them at the edge again. Also ends once `owner` (the sidebar
 /// pane) is gone: nothing would point the viewer anywhere.
 fn view(file: &Path, owner: Option<&str>) -> Result<()> {
     let mut request_text = String::new();
     let mut rendered: Option<(String, u16)> = None;
+    let mut request: Option<DiffRequest> = None;
+    // The patch shown: `None` while there is no request.
+    let mut patch: Option<Result<String, String>> = None;
+    let mut next_refresh = Instant::now() + REFRESH;
     let mut lines: Vec<String> = Vec::new();
     let mut wrap = false;
     // The rows on screen (`lines`, wrapped or not) and, per row, its line in `lines`.
@@ -126,14 +138,30 @@ fn view(file: &Path, owner: Option<&str>) -> Result<()> {
                 request_text = text;
                 scroll = 0;
             }
-        if rendered.as_ref() != Some(&(request_text.clone(), cols)) {
-            lines = match serde_json::from_str::<DiffRequest>(&request_text) {
-                Ok(request) => diff_lines(&request, cols, &mut patches),
-                Err(_) => vec!["waiting for a file…".into()],
-            };
+        let new = rendered.as_ref() != Some(&(request_text.clone(), cols));
+        if new {
+            request = serde_json::from_str(&request_text).ok();
             rendered = Some((request_text.clone(), cols));
-            (shown, origin) = layout(&lines, wrap, cols);
-            dirty = true;
+        }
+        let refresh = Instant::now() >= next_refresh && request.as_ref().is_some_and(DiffRequest::changes);
+        if new || refresh {
+            next_refresh = Instant::now() + REFRESH;
+            let (fresh, repo) = match &request {
+                Some(request) => {
+                    let (fresh, repo) = read_patch(request, &mut patches);
+                    (Some(fresh), repo)
+                }
+                None => (None, None),
+            };
+            if new || fresh != patch {
+                lines = match &fresh {
+                    Some(fresh) => diff_lines(fresh, repo, cols),
+                    None => vec!["waiting for a file…".into()],
+                };
+                patch = fresh;
+                (shown, origin) = layout(&lines, wrap, cols);
+                dirty = true;
+            }
         }
         // The last row holds the key hint; the diff scrolls above it.
         let page = usize::from(rows.saturating_sub(1)).max(1);
@@ -196,9 +224,9 @@ fn layout(lines: &[String], wrap: bool, cols: u16) -> (Vec<String>, Vec<usize>) 
     (shown, origin)
 }
 
-/// The request's patch as ANSI lines, formatted by delta when that is the user's git pager.
-fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut Patches) -> Vec<String> {
-    let (patch, repo) = match request {
+/// The request's patch, and the checkout it comes from.
+fn read_patch<'a>(request: &'a DiffRequest, patches: &mut Patches) -> (Result<String, String>, Option<&'a Path>) {
+    match request {
         DiffRequest::Local { root, .. } => (local_patch(request, root), Some(root.as_path())),
         DiffRequest::Worktree { root } => (worktree_patch(root), Some(root.as_path())),
         DiffRequest::Commit { commit, path } => match commit.local() {
@@ -206,15 +234,19 @@ fn diff_lines(request: &DiffRequest, cols: u16, patches: &mut Patches) -> Vec<St
             None => (remote_commit_patch(patches, commit, path.as_deref()), None),
         },
         DiffRequest::Pr { url } => (fetched(patches, url, || github::pr_diff(url)), None),
-    };
+    }
+}
+
+/// A patch from `repo` as ANSI lines, formatted by delta when that is the user's git pager.
+fn diff_lines(patch: &Result<String, String>, repo: Option<&Path>, cols: u16) -> Vec<String> {
     let patch = match patch {
         Ok(patch) if patch.trim().is_empty() => return vec!["no changes".into()],
         Ok(patch) => patch,
-        Err(e) => return vec![e],
+        Err(e) => return vec![e.clone()],
     };
     let formatted = match delta_pager(repo) {
-        Some(pager) => through_delta(&pager, &patch, cols).unwrap_or_else(|| colorize(&patch)),
-        None => colorize(&patch),
+        Some(pager) => through_delta(&pager, patch, cols).unwrap_or_else(|| colorize(patch)),
+        None => colorize(patch),
     };
     formatted.lines().map(|l| l.replace('\t', "    ")).collect()
 }

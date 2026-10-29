@@ -25,6 +25,13 @@ const LINKS_KEPT: usize = 50;
 /// later than that are not counted as the chat's.
 const CALL_MAX_MS: i64 = 2 * 60 * 60 * 1000;
 
+/// The transcript of the pane's chat, when herdr names both the agent and its session.
+fn transcript_of(pane: &PaneInfo) -> Option<Transcript> {
+    let format = pane.agent.as_deref().and_then(Format::of_agent)?;
+    let fallback_cwd = pane.cwd.clone().map(PathBuf::from).unwrap_or_default();
+    Some(Transcript::new(format, pane.agent_session.as_ref()?.value.clone(), fallback_cwd))
+}
+
 /// Picks the followed agent pane and records repos under its processes' working dirs.
 /// Returns whether the repo list changed.
 pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
@@ -55,23 +62,21 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
         Some(session) if !switched => {
             session.pane_id = target.pane_id.clone();
             session.title = title;
+            // After a restart herdr names the chat before it has detected the agent: the
+            // transcript is followed once it knows which agent it is.
+            if session.transcript.is_none() {
+                session.transcript = transcript_of(target);
+            }
             session
         }
         slot => {
             let saved = if persisted { state::load_session(&key) } else { SessionState { key, ..SessionState::default() } };
-            let fallback_cwd = target.cwd.clone().map(PathBuf::from).unwrap_or_default();
-            let transcript = target
-                .agent
-                .as_deref()
-                .and_then(Format::of_agent)
-                .zip(target.agent_session.as_ref())
-                .map(|(format, s)| Transcript::new(format, s.value.clone(), fallback_cwd));
             slot.insert(Session {
                 pane_id: target.pane_id.clone(),
                 title,
                 saved,
                 persisted,
-                transcript,
+                transcript: transcript_of(target),
                 links: Vec::new(),
                 calls: Vec::new(),
             })
@@ -133,12 +138,15 @@ pub(super) fn sample(me: &str, model: &mut Model) -> Result<bool> {
             dirty = true;
         }
     }
-    // A PR belongs to the touched checkout whose remote is its repo, and is listed under it.
+    // Each checkout's GitHub repos, looked up once: PRs are placed by them.
+    for record in &saved.repos {
+        model.remotes.entry(record.root.clone()).or_insert_with(|| github::remote_slugs(&record.root));
+    }
+    // A PR belongs to the first touched checkout whose remote is its repo; it is listed there
+    // unless another checkout has its head branch out.
     for pr in saved.prs.iter_mut().filter(|p| p.root.is_none()) {
         let slug = pr.pr.slug();
-        let owner = saved.repos.iter().find(|r| {
-            model.remotes.entry(r.root.clone()).or_insert_with(|| github::remote_slugs(&r.root)).contains(&slug)
-        });
+        let owner = saved.repos.iter().find(|r| model.remotes.get(&r.root).is_some_and(|slugs| slugs.contains(&slug)));
         if let Some(record) = owner {
             pr.root = Some(record.root.clone());
             dirty = true;
@@ -207,18 +215,23 @@ pub(super) fn apply_prs(model: &mut Model, batch: PrBatch) {
 }
 
 /// Records each touched repo's fingerprint at first touch, and marks it changed once the
-/// fingerprint moves: catches changes made by shell commands, not just edit/write tools.
+/// fingerprint moves, or once an uncommitted file turns out written during one of the chat's
+/// tool calls: catches changes made by shell commands, not just edit/write tools.
 pub(super) fn track_changes(model: &mut Model) -> Result<()> {
     let Some(session) = &mut model.session else { return Ok(()) };
+    let windows = call_windows(session, now_ms());
     let mut dirty = false;
     for record in &mut session.saved.repos {
         let Some(Ok(status)) = model.statuses.get(&record.root) else { continue };
-        match record.baseline {
-            None => record.baseline = Some(status.fingerprint),
-            Some(base) if base != status.fingerprint && !record.changed => record.changed = true,
-            Some(_) => continue,
+        let moved = record.baseline.is_some_and(|base| base != status.fingerprint);
+        if record.baseline.is_none() {
+            record.baseline = Some(status.fingerprint);
+            dirty = true;
         }
-        dirty = true;
+        if !record.changed && (moved || git::written_within(&record.root, status, &windows)) {
+            record.changed = true;
+            dirty = true;
+        }
     }
     if dirty {
         session.save()?;
@@ -302,3 +315,4 @@ mod tests {
         assert!(!model.pr_errors.contains_key(&pr("r", 2).url()), "a batch of a chat no longer followed");
     }
 }
+

@@ -619,7 +619,7 @@ mod fixture {
     /// A fetched pull request without checks, active on GitHub at time 1.
     pub(super) fn view(state: PrState, commits: Vec<PrCommit>) -> PrView {
         let title = "lodge every beneficial owner as owner too".into();
-        PrView { status: PrStatus { state, checks: None }, title, commits, merge: None, updated: Some(1) }
+        PrView { status: PrStatus { state, checks: None }, title, head: "feature".into(), commits, merge: None, updated: Some(1) }
     }
 
     pub(super) fn gh(oid: &str, subject: &str, time: i64) -> PrCommit {
