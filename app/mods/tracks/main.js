@@ -6,12 +6,15 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 // herdr's exec takes an argv array and runs no shell, like execFile.
-import { agents, focused, panes, exec as execFile, readTextFile, watchFolder, theme, run, setShared, openOverlay, closeOverlay, props } from "herdr";
+import { agents, focused, panes, fonts, exec as execFile, readTextFile, watchFolder, theme, run, setShared, openOverlay, closeOverlay, props } from "herdr";
 
 const BIN = "herdr-tracks";
 // Commits listed per repo and per pull request; older ones are counted on one more row.
 const COMMITS_SHOWN = 10;
 const ROW = 22;
+// A fixed-width font, as the classic sidebar's terminal had: Liberation Mono where installed,
+// else the one Herdr ships.
+const MONO = () => (fonts().includes("Liberation Mono") ? "Liberation Mono" : "JetBrains Mono");
 // Link rows in view; more scroll.
 const LINKS_SHOWN = 8;
 
@@ -170,7 +173,7 @@ export default class Tracks extends View {
       const key = `${repo.root}:${c.path}`;
       rows.push(this.row(`file-${key}`, t, this.selected === key).cursor_pointer()
         .on_click(() => this.select(key, c.diff))
-        .child(div().w(18).flex_none().text_color(changeColor(c.code, t)).font_family("JetBrains Mono").child(c.code.replace(" ", "·")))
+        .child(div().w(18).flex_none().text_color(changeColor(c.code, t)).child(c.code.replace(" ", "·")))
         .child(div().flex_1().min_w(0).text_ellipsis_start().whitespace_nowrap().overflow_hidden().child(c.display))
         .children(statText(c.stat, t)));
     }
@@ -213,7 +216,7 @@ export default class Tracks extends View {
         .on_click((_e, cx) => { this.expandCommit(c); cx.notify(); }).child(expanded ? "▾" : "▸"))
       .child(div().id(`commit-body-${id}`).flex_1().min_w(0).flex().gap(6).cursor_pointer()
         .on_click((e) => (e.modifiers.control && c.url ? open(c.url) : this.select(c.hash, c.diff)))
-        .child(div().flex_none().text_color(t.dim).font_family("JetBrains Mono").child(short(c.hash)))
+        .child(div().flex_none().text_color(t.dim).child(short(c.hash)))
         .child(div().min_w(0).truncate().text_color(c.chat ? t.foreground : t.dim).child(c.subject)))];
     if (!expanded) return rows;
     const files = this.model?.files?.[c.hash];
@@ -273,7 +276,8 @@ export default class Tracks extends View {
     const links = m?.links ?? [];
     // A card like the Files and Changes panels it sits beside.
     return v_flex().id("tracks").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border)
-      .text_color(t.foreground).text_size(12.5)
+      .font_family(MONO())
+      .text_color(t.foreground).text_size(12)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().flex_none().child("Tracks"))
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(m?.title ?? "")))
