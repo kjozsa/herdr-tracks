@@ -1,3 +1,4 @@
+mod app;
 mod classic;
 
 use classic::{diff, dock, sidebar};
@@ -15,8 +16,9 @@ fn main() {
         "ensure" => dock::ensure(),
         "show" => dock::show(),
         "startup" => dock::startup(),
+        "app" => app::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("usage: {BIN_NAME} pane|diff|ensure|show|startup");
+            eprintln!("usage: {BIN_NAME} pane|diff|ensure|show|startup|app");
             std::process::exit(2);
         }
     };

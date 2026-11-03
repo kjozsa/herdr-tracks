@@ -19,11 +19,12 @@ pub enum Format {
 }
 
 impl Format {
-    /// The dialect of a herdr agent label, if its transcripts are understood.
+    /// The dialect of an agent as herdr (`claude`) or the Herdr app (`claude-code`) names it,
+    /// if its transcripts are understood.
     pub fn of_agent(agent: &str) -> Option<Self> {
         match agent {
             "omp" => Some(Format::Omp),
-            "claude" => Some(Format::Claude),
+            "claude" | "claude-code" => Some(Format::Claude),
             _ => None,
         }
     }

@@ -1,7 +1,7 @@
 //! Where each of a chat's pull requests and commits is listed, across the checkouts it touched.
 
 use super::git::Commit;
-use super::github::PrView;
+use super::github::{PrCommit, PrView};
 use super::state::{PrRecord, RepoRecord, SessionState};
 use super::Tracker;
 use std::collections::HashMap;
@@ -105,4 +105,26 @@ pub fn history<'a>(tracker: &'a Tracker, placed: &Placed<'a>, root: &Path) -> Ve
     // Stable: among equals (PRs without a time), the newer number stays first.
     entries.sort_by_key(|e| std::cmp::Reverse(e.time()));
     entries
+}
+
+/// A commit of a pull request as listed: its subject (the checkout's, for the merge commit
+/// GitHub gives none for) and whether the chat made it.
+pub struct PrCommitLine<'a> {
+    pub oid: &'a str,
+    pub subject: &'a str,
+    pub chat: bool,
+}
+
+/// A pull request's commits, its merge commit included, newest first.
+pub fn pr_commits<'a>(placed: &Placed<'a>, view: &'a PrView) -> Vec<PrCommitLine<'a>> {
+    let mut commits: Vec<&PrCommit> = view.merge.iter().chain(&view.commits).collect();
+    commits.sort_by_key(|c| std::cmp::Reverse(c.time));
+    commits
+        .into_iter()
+        .map(|commit| {
+            let mine = placed.chat.iter().find(|c| c.hash == commit.oid);
+            let subject = commit.subject.as_deref().or(mine.map(|c| c.subject.as_str())).unwrap_or("merge commit");
+            PrCommitLine { oid: &commit.oid, subject, chat: mine.is_some() }
+        })
+        .collect()
 }

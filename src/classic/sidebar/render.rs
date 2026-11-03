@@ -7,7 +7,7 @@ use anyhow::Result;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 use herdr_tracks::engine::git::{LineStat, RepoStatus};
-use herdr_tracks::engine::github::{Checks, PrCommit, PrState, PrView};
+use herdr_tracks::engine::github::{Checks, PrState, PrView};
 use herdr_tracks::engine::patch::CommitAt;
 use herdr_tracks::engine::place::{self, Entry, Placed};
 use herdr_tracks::engine::state::PrRecord;
@@ -223,14 +223,10 @@ fn push_pr(rows: &mut Vec<Row>, model: &Model, placed: &Placed, pr: &PrRecord, r
         rows.push(Row::new(vec![("    …".into(), Tone::Dim)]));
         return;
     };
-    let mut commits: Vec<&PrCommit> = view.merge.iter().chain(&view.commits).collect();
-    commits.sort_by_key(|c| std::cmp::Reverse(c.time));
+    let commits = place::pr_commits(placed, view);
     for commit in commits.iter().take(COMMITS_SHOWN) {
-        let mine = placed.chat.iter().find(|c| c.hash == commit.oid);
-        // GitHub names no subject for the merge commit; the checkout may know it.
-        let subject = commit.subject.as_deref().or(mine.map(|c| c.subject.as_str())).unwrap_or("merge commit");
-        let at = CommitAt { hash: commit.oid.clone(), root: root.cloned(), repo: Some(pr.pr.slug()) };
-        let commit = CommitLine { at, under: Some(url.clone()), subject, chat: mine.is_some() };
+        let at = CommitAt { hash: commit.oid.to_string(), root: root.cloned(), repo: Some(pr.pr.slug()) };
+        let commit = CommitLine { at, under: Some(url.clone()), subject: commit.subject, chat: commit.chat };
         push_commit(rows, model, commit, "   ", cols);
     }
     if commits.len() > COMMITS_SHOWN {

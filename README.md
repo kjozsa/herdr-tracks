@@ -118,6 +118,34 @@ type = "plugin_action"
 command = "kjozsa.tracks.show"
 ```
 
+## Herdr app
+
+The same tracks show in the [Herdr app](https://herdr.dev) (`herdr-app`) as a **Tracks** panel
+beside Files and Changes, following the agent of the focused tab. Click a file, repo, pull
+request title or commit to open its diff in a pane next to the agent; that pane takes the
+keyboard: `j`/`k` or arrows scroll a line, `space`/`b` a page, `g`/`G` to either end, `q` or
+`Esc` close. The markers expand pull requests and commits, a pull request's number opens it in
+the browser, and right-click dismisses repos, pull requests and links. Claude Code chats are
+read from their transcript; other agents get the repos their processes work in.
+
+```sh
+cargo build --release
+app/install.sh   # copies the mods into ~/.config/herdr-app/mods, links herdr-tracks onto the PATH
+```
+
+Herdr's own layout and tab bar are read-only, so the panel needs copies of them: duplicate the
+`main` layout and the `tabs` mod (`herdr-app do layout.clone '{"name":"main","as":"main-tracks"}'`,
+`herdr-app do mod.clone '{"name":"tabs","as":"tabs-tracks"}'`), add
+`{ "id": "tracks", "type": "block", "content": { "mod": "tracks" } }` to the layout's
+`panel-body` stack, point its `tabs` block at `tabs-tracks`, and add a
+`panelButton("tracks", "Tracks", …)` next to the Changes one in `tabs-tracks`.
+
+Mods cannot follow transcripts, so the panel starts `herdr-tracks app serve` as a transient user
+unit (`herdr-tracks-app`). It tracks every agent terminal of the local herdr-core, writes one
+model per terminal to `~/.local/state/herdr/plugins/kjozsa.tracks/app/models/`, and exits ten
+minutes after the panel last asked for it, or when the binary is rebuilt (the panel starts the
+new one within a minute). Chats keep the same state as in the classic plugin.
+
 ## Files
 
 Plugin state lives in `~/.local/state/herdr/plugins/kjozsa.tracks/`: one file per chat with its

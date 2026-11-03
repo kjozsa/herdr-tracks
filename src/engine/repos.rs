@@ -3,15 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// Working directories of `root_pid` and all its descendants, found through each thread's
+/// `root_pid` and all its descendants, found through each thread's
 /// `/proc/<pid>/task/<tid>/children` list (Linux) instead of scanning every process.
-pub fn process_tree_cwds(root_pid: u32) -> Vec<PathBuf> {
-    let mut cwds = Vec::new();
+pub fn process_tree(root_pid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
     let mut stack = vec![root_pid];
     while let Some(pid) = stack.pop() {
-        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-            cwds.push(cwd);
-        }
+        found.push(pid);
         let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
         for task in tasks.flatten() {
             if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
@@ -19,7 +17,12 @@ pub fn process_tree_cwds(root_pid: u32) -> Vec<PathBuf> {
             }
         }
     }
-    cwds
+    found
+}
+
+/// Working directories of `root_pid` and all its descendants.
+pub fn process_tree_cwds(root_pid: u32) -> Vec<PathBuf> {
+    process_tree(root_pid).into_iter().filter_map(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok()).collect()
 }
 
 /// The git checkout containing `path` (a `.git` directory, or a `.git` file for worktrees).
