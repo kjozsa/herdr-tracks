@@ -1,10 +1,12 @@
 //! Docking the sidebar as a right-edge split of a tab, sized to herdr's left sidebar.
 
-use crate::herdr::{self, Layout, PaneInfo};
-use crate::state::DockGuard;
-use anyhow::{anyhow, bail, Result};
+use super::diff;
+use super::herdr::{self, Layout, PaneInfo};
+use anyhow::{anyhow, bail, Context, Result};
+use herdr_tracks::engine::state::{self, state_dir, write_atomic};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Columns left for the rest of the tab; narrower tabs are not auto-docked.
@@ -148,9 +150,37 @@ pub fn startup() -> Result<()> {
     guard.save()?;
     let pane_ids: Vec<&str> = live.into_iter().collect();
     let sessions: Vec<&str> = panes.iter().filter_map(|p| p.agent_session.as_ref()).map(|s| s.value.as_str()).collect();
-    let removed = crate::state::prune(&pane_ids, &sessions)?;
+    let removed = diff::prune_requests(&pane_ids)? + state::prune_sessions(&sessions)?;
     println!("startup: replaced {} restored pane(s), docked {docked} sidebar(s), removed {removed} stale file(s)", closed.len());
     Ok(())
+}
+
+/// Exclusive hold on the dock state; concurrent hooks serialize on `dock.lock`.
+pub struct DockGuard {
+    _lock: File,
+    path: PathBuf,
+    /// Sidebar pane id per tab id.
+    pub tabs: BTreeMap<String, String>,
+}
+
+impl DockGuard {
+    pub fn acquire() -> Result<Self> {
+        let dir = state_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let lock = File::create(dir.join("dock.lock"))?;
+        lock.lock()?;
+        let path = dir.join("dock.json");
+        let tabs = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|mut v| serde_json::from_value(v["tabs"].take()).ok())
+            .unwrap_or_default();
+        Ok(Self { _lock: lock, path, tabs })
+    }
+
+    pub fn save(&self) -> Result<()> {
+        write_atomic(&self.path, &serde_json::to_vec_pretty(&serde_json::json!({ "tabs": self.tabs }))?)
+    }
 }
 
 /// Manifest titles of the plugin's panes; herdr shows them as pane labels.
@@ -187,7 +217,7 @@ fn dock(tab_panes: &[&PaneInfo]) -> Result<Option<String>> {
         return Ok(None);
     }
     let target = dock_target(&layout)?;
-    let pane = herdr::open_plugin_pane(crate::PLUGIN_ID, crate::SIDEBAR_ENTRYPOINT, &target, false, &[])?;
+    let pane = herdr::open_plugin_pane(herdr_tracks::PLUGIN_ID, crate::SIDEBAR_ENTRYPOINT, &target, false, &[])?;
     if let Err(e) = snap_width(&pane, width) {
         eprintln!("sizing {pane}: {e:#}");
     }

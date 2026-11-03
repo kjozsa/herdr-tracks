@@ -1,16 +1,17 @@
 //! Laying out and drawing the sidebar: repo headers, file and pull-request rows, the visible
 //! window of a long list, and terminal output.
 
-use super::{Click, Key, Menu, Model, Target};
-use crate::ansi::{self, fit_end, fit_start};
-use crate::diff::CommitAt;
-use crate::git::{Commit, LineStat, RepoStatus};
-use crate::github::{self, Checks, PrCommit, PrState, PrView};
-use crate::state::{PrRecord, RepoRecord, SessionState};
+use super::{Click, Key, Menu, Model};
+use crate::classic::ansi::{self, fit_end, fit_start};
 use anyhow::Result;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
-use std::collections::HashMap;
+use herdr_tracks::engine::git::{LineStat, RepoStatus};
+use herdr_tracks::engine::github::{Checks, PrCommit, PrState, PrView};
+use herdr_tracks::engine::patch::CommitAt;
+use herdr_tracks::engine::place::{self, Entry, Placed};
+use herdr_tracks::engine::state::PrRecord;
+use herdr_tracks::engine::Target;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -135,17 +136,17 @@ impl View {
 
 pub(super) fn render(model: &Model, cols: usize) -> Screen {
     let mut rows: Vec<Row> = Vec::new();
-    if let Some(err) = &model.error {
+    if let Some(err) = &model.tracker.error {
         rows.push(fitted(&format!("! {err}"), Tone::Error, cols));
     }
-    let Some(session) = &model.session else {
+    let Some(session) = &model.tracker.session else {
         rows.push(fitted("no agent in this tab", Tone::Dim, cols));
         return Screen { rows };
     };
     if !session.title.is_empty() {
         rows.push(fitted(&session.title, Tone::Dim, cols));
     }
-    let placed = place(model, &session.saved);
+    let placed = place::place(&model.tracker, &session.saved);
     let orphans: Vec<&PrRecord> = placed.prs.iter().filter(|(_, at)| at.is_none()).map(|(pr, _)| *pr).collect();
     if placed.shown.is_empty() && orphans.is_empty() {
         rows.push(fitted("no changes yet", Tone::Dim, cols));
@@ -155,10 +156,10 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
             rows.push(Row::default());
         }
         // The header shows all uncommitted changes at once.
-        let header = repo_header(root, model.statuses.get(root), cols);
+        let header = repo_header(root, model.tracker.statuses.get(root), cols);
         rows.push(Row { menu: Some(Target::Repo(root.clone())), click: Some(Click::Repo { root: root.clone() }), ..Row::new(header) });
         // Uncommitted work first: it is the freshest.
-        match model.statuses.get(root) {
+        match model.tracker.statuses.get(root) {
             None => {}
             Some(Err(e)) => rows.push(fitted(&format!(" ! {e}"), Tone::Error, cols)),
             Some(Ok(s)) => {
@@ -171,8 +172,8 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
                 }
             }
         }
-        let entries = history(model, &placed, root);
-        let repo = model.remotes.get(root).and_then(|slugs| slugs.first()).cloned();
+        let entries = place::history(&model.tracker, &placed, root);
+        let repo = model.tracker.remotes.get(root).and_then(|slugs| slugs.first()).cloned();
         let mut loose = 0;
         for entry in &entries {
             match entry {
@@ -203,106 +204,6 @@ pub(super) fn render(model: &Model, cols: usize) -> Screen {
     Screen { rows }
 }
 
-/// Where the repos list each pull request and each of the chat's commits.
-///
-/// Checkouts of one repository can all list a commit (worktrees share branches); it shows
-/// once. A PR shows under the checkout of its head branch, else the one it was recorded with;
-/// a commit inside the PR holding it, else under a checkout whose HEAD reaches it, else the
-/// first checkout listing it. A commit no HEAD reaches that repeats the subject of one of the
-/// chat's commits a PR holds (the copy left on the old branch by a rebase or cherry-pick) is
-/// not listed.
-struct Placed<'a> {
-    /// Listed PRs, by repo and newest first, each with the checkout it shows under (`None`:
-    /// no touched checkout, a heading of its own).
-    prs: Vec<(&'a PrRecord, Option<&'a PathBuf>)>,
-    /// Checkouts shown, in the chat's order.
-    shown: Vec<&'a PathBuf>,
-    /// The chat's commits in shown checkouts, each once.
-    chat: Vec<&'a Commit>,
-    /// The chat's commits no listed PR holds, by the checkout they show under.
-    loose: HashMap<&'a Path, Vec<&'a Commit>>,
-}
-
-fn place<'a>(model: &'a Model, saved: &'a SessionState) -> Placed<'a> {
-    // Repos the chat changed or has pull requests in (`refresh_git` skips deleted ones), then
-    // PRs whose repo has no touched checkout. Whatever the user dismissed stays hidden.
-    // Without a checkout, PRs go newest first by number: GitHub numbers them in creation order.
-    let mut prs: Vec<&PrRecord> = saved.visible_prs().collect();
-    prs.sort_by_key(|p| (p.pr.slug(), std::cmp::Reverse(p.pr.number)));
-    let open: Vec<&RepoRecord> =
-        saved.repos.iter().filter(|r| model.statuses.contains_key(&r.root) && !saved.repo_dismissed(&r.root)).collect();
-    let on_head_branch = |pr: &PrRecord| {
-        let head = &model.pr_views.get(&pr.pr.url())?.head;
-        let checkout = open.iter().find(|r| {
-            matches!(model.statuses.get(&r.root), Some(Ok(s)) if s.branch == *head)
-                && model.remotes.get(&r.root).is_some_and(|slugs| slugs.contains(&pr.pr.slug()))
-        });
-        checkout.map(|r| &r.root)
-    };
-    let prs: Vec<(&PrRecord, Option<&PathBuf>)> = prs.into_iter().map(|p| (p, on_head_branch(p).or(p.root.as_ref()))).collect();
-    let shown: Vec<&PathBuf> =
-        open.iter().filter(|r| r.changed || prs.iter().any(|(_, at)| *at == Some(&r.root))).map(|r| &r.root).collect();
-
-    let listed = |root: &PathBuf, hash: &str| model.commits.get(root).into_iter().flatten().find(|c| c.hash == hash);
-    let mut chat: Vec<&Commit> = Vec::new();
-    for commit in shown.iter().flat_map(|root| model.commits.get(*root).into_iter().flatten()) {
-        if !chat.iter().any(|c| c.hash == commit.hash) {
-            chat.push(commit);
-        }
-    }
-    let views: Vec<&PrView> = prs.iter().filter_map(|(p, _)| model.pr_views.get(&p.pr.url())).collect();
-    let held = |c: &Commit| views.iter().any(|v| v.holds(&c.hash));
-    let reached = |c: &Commit| shown.iter().any(|root| listed(root, &c.hash).is_some_and(|c| c.on_head));
-    let same_repo = |a: &Commit, b: &Commit| shown.iter().any(|root| listed(root, &a.hash).is_some() && listed(root, &b.hash).is_some());
-    let superseded =
-        |c: &Commit| !reached(c) && chat.iter().any(|k| k.hash != c.hash && k.subject == c.subject && held(k) && same_repo(c, k));
-    let mut loose: HashMap<&Path, Vec<&Commit>> = HashMap::new();
-    for &commit in chat.iter().filter(|c| !held(c) && !superseded(c)) {
-        let home = shown
-            .iter()
-            .find(|root| listed(root, &commit.hash).is_some_and(|c| c.on_head))
-            .or_else(|| shown.iter().find(|root| listed(root, &commit.hash).is_some()));
-        if let Some(home) = home {
-            loose.entry(home.as_path()).or_default().push(commit);
-        }
-    }
-    Placed { prs, shown, chat, loose }
-}
-
-/// What a repo's history lists: a pull request, or a commit of the chat's that no listed pull
-/// request holds.
-enum Entry<'a> {
-    Pr { pr: &'a PrRecord, time: Option<i64> },
-    Commit(&'a Commit),
-}
-
-impl Entry<'_> {
-    /// When it last moved: a commit's time; a PR's newest held commit or GitHub activity.
-    fn time(&self) -> Option<i64> {
-        match self {
-            Entry::Pr { time, .. } => *time,
-            Entry::Commit(commit) => Some(commit.time),
-        }
-    }
-}
-
-/// The repo's pull requests and the chat's commits there in one list, freshest first. A PR
-/// is as fresh as the newest of the chat's commits it holds, or its last activity on GitHub;
-/// PRs with neither (not fetched yet) go last.
-fn history<'a>(model: &'a Model, placed: &Placed<'a>, root: &Path) -> Vec<Entry<'a>> {
-    let mut entries: Vec<Entry> = Vec::new();
-    for (pr, _) in placed.prs.iter().filter(|(_, at)| at.is_some_and(|at| at == root)) {
-        let view = model.pr_views.get(&pr.pr.url());
-        let held = placed.chat.iter().filter(|c| view.is_some_and(|v| v.holds(&c.hash))).map(|c| c.time);
-        let time = held.chain(view.and_then(|v| v.updated)).max();
-        entries.push(Entry::Pr { pr, time });
-    }
-    entries.extend(placed.loose.get(root).into_iter().flatten().map(|c| Entry::Commit(c)));
-    // Stable: among equals (PRs without a time), the newer number stays first.
-    entries.sort_by_key(|e| std::cmp::Reverse(e.time()));
-    entries
-}
-
 fn earlier(indent: &str, more: usize) -> String {
     format!("{indent}  … {more} earlier commit{}", if more == 1 { "" } else { "s" })
 }
@@ -312,8 +213,8 @@ fn earlier(indent: &str, more: usize) -> String {
 fn push_pr(rows: &mut Vec<Row>, model: &Model, placed: &Placed, pr: &PrRecord, root: Option<&PathBuf>, cols: usize) {
     let url = pr.pr.url();
     let expanded = model.expanded.contains(&url);
-    let view = model.pr_views.get(&url);
-    let line = pr_line(pr.pr.number, view, model.pr_errors.get(&url), expanded, cols);
+    let view = model.tracker.pr_views.get(&url);
+    let line = pr_line(pr.pr.number, view, model.tracker.pr_errors.get(&url), expanded, cols);
     rows.push(Row { click: Some(Click::Pr { url: url.clone() }), menu: Some(Target::Pr(pr.pr.clone())), ..Row::new(line) });
     if !expanded {
         return;
@@ -356,7 +257,7 @@ fn push_commit(rows: &mut Vec<Row>, model: &Model, commit: CommitLine, indent: &
         return;
     }
     let indent = format!("{indent}   ");
-    match model.commit_files.get(&at.hash) {
+    match model.tracker.commit_files.get(&at.hash) {
         None => rows.push(Row::new(vec![(format!("{indent}…"), Tone::Dim)])),
         Some(Err(e)) => rows.push(fitted(&format!("{indent}! {e}"), Tone::Error, cols)),
         Some(Ok(files)) => {
@@ -461,10 +362,8 @@ fn pr_line(number: u32, view: Option<&PrView>, error: Option<&String>, expanded:
 /// `─ links 4–12 of 30`. `scroll` is clamped to the list. Pull requests already listed above
 /// are left out. Empty when there is nothing to show or no room.
 pub(super) fn links(model: &Model, cols: usize, max: usize, scroll: &mut usize) -> Vec<Row> {
-    let Some(session) = &model.session else { return Vec::new() };
-    let saved = &session.saved;
-    let listed = |url: &str| github::pr_urls(url).iter().any(|pr| saved.prs.iter().any(|p| p.pr.same(pr)));
-    let urls: Vec<&String> = session.links.iter().filter(|url| !listed(url) && !saved.link_dismissed(url)).collect();
+    let Some(session) = &model.tracker.session else { return Vec::new() };
+    let urls = session.shown_links();
     let room = max.saturating_sub(1);
     if urls.is_empty() || room == 0 {
         return Vec::new();
@@ -666,9 +565,9 @@ fn style(out: &mut impl Write, tone: Tone) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::DiffRequest;
-    use crate::git::{Change, FileChange};
-    use crate::sidebar::fixture::{clean, fixture, gh, pr, root, session, text, view};
+    use crate::classic::sidebar::fixture::{clean, fixture, gh, pr, root, session, text, view};
+    use herdr_tracks::engine::git::{Change, Commit, FileChange};
+    use herdr_tracks::engine::patch::DiffRequest;
 
     /// Selectable rows under the repo headers.
     fn keys(screen: &Screen) -> Vec<Key> {
@@ -700,8 +599,8 @@ mod tests {
     fn the_header_shows_all_uncommitted_changes_and_only_those_are_file_rows() {
         let mut model = fixture(&["e2e"], &[]);
         let changes = vec![Change { code: *b" M", path: "a.py".into(), orig: None, stat: None }];
-        model.statuses.insert(root("e2e"), Ok(RepoStatus { changes, ahead: 2, ..clean() }));
-        model.commits.insert(root("e2e"), commits(2));
+        model.tracker.statuses.insert(root("e2e"), Ok(RepoStatus { changes, ahead: 2, ..clean() }));
+        model.tracker.commits.insert(root("e2e"), commits(2));
         let screen = render(&model, 40);
         let header = row(&screen, &Key::Repo(root("e2e"))).click.as_ref().unwrap();
         assert_eq!(header.diff_request(), DiffRequest::Worktree { root: root("e2e") });
@@ -711,7 +610,7 @@ mod tests {
     #[test]
     fn the_chat_s_commits_show_newest_first_and_count_the_rest() {
         let mut model = fixture(&["e2e"], &[]);
-        model.commits.insert(root("e2e"), commits(12));
+        model.tracker.commits.insert(root("e2e"), commits(12));
         let screen = render(&model, 40);
         assert_eq!(keys(&screen), (2..12).rev().map(|n| Key::Commit(format!("h{n}"))).collect::<Vec<_>>());
         let last = screen.rows.last().unwrap();
@@ -725,9 +624,9 @@ mod tests {
         // A PR is as fresh as the newest of the chat's commits it holds (or its last activity
         // on GitHub); a PR not fetched yet goes last.
         let mut model = fixture(&["e2e"], &[pr("e2e", 5), pr("e2e", 6)]);
-        model.commits.insert(root("e2e"), commits(12));
+        model.tracker.commits.insert(root("e2e"), commits(12));
         let held = vec![gh("h3", "gh 3", 3), gh("h7", "gh 7", 7), gh("x1", "someone else's", 8)];
-        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, held));
+        model.tracker.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, held));
         let commits = |ns: &[i64]| ns.iter().map(|n| Key::Commit(format!("h{n}"))).collect::<Vec<_>>();
         let prs = |n| vec![Key::Pr(pr("e2e", n).url())];
         let expected = [commits(&[11, 10, 9, 8]), prs(5), commits(&[6, 5, 4, 2, 1, 0]), prs(6)].concat();
@@ -741,8 +640,8 @@ mod tests {
         let mut model = fixture(&["infra", "sweep"], &[pr("infra", 160)]);
         let commit = |hash: &str, time, subject: &str, on_head| Commit { hash: hash.into(), time, subject: subject.into(), on_head };
         for (name, branch) in [("infra", "main"), ("sweep", "feature")] {
-            model.remotes.insert(root(name), vec!["o/infra".into()]);
-            model.statuses.insert(root(name), Ok(RepoStatus { branch: branch.into(), ..clean() }));
+            model.tracker.remotes.insert(root(name), vec!["o/infra".into()]);
+            model.tracker.statuses.insert(root(name), Ok(RepoStatus { branch: branch.into(), ..clean() }));
             let sweep = name == "sweep";
             let listed = vec![
                 commit("h2", 4, "run the sweep", sweep),
@@ -751,9 +650,9 @@ mod tests {
                 commit("old", 2, "run the sweep", false),
                 commit("h0", 1, "on no checkout's branch", false),
             ];
-            model.commits.insert(root(name), listed);
+            model.tracker.commits.insert(root(name), listed);
         }
-        model.pr_views.insert(pr("infra", 160).url(), view(PrState::Open, vec![gh("h2", "run the sweep", 4)]));
+        model.tracker.pr_views.insert(pr("infra", 160).url(), view(PrState::Open, vec![gh("h2", "run the sweep", 4)]));
         let screen = render(&model, 40);
         let at = |key: Key| screen.row_of(Some(&key)).unwrap();
         let commit = |hash: &str| Key::Commit(hash.into());
@@ -772,8 +671,8 @@ mod tests {
     #[test]
     fn pr_rows_show_the_fetched_state_and_the_title_cut_to_fit() {
         let mut model = fixture(&["e2e"], &[pr("e2e", 5), pr("e2e", 6), pr("e2e", 7)]);
-        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, Vec::new()));
-        model.pr_errors.insert(pr("e2e", 7).url(), "gh: offline".into());
+        model.tracker.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, Vec::new()));
+        model.tracker.pr_errors.insert(pr("e2e", 7).url(), "gh: offline".into());
         let screen = render(&model, 40);
         let shown = |number| text(&row(&screen, &Key::Pr(pr("e2e", number).url())).line);
         assert_eq!(ansi::width(&shown(5)), 40);
@@ -785,7 +684,7 @@ mod tests {
     #[test]
     fn pr_rows_split_into_marker_link_and_title() {
         let mut model = fixture(&["e2e"], &[pr("e2e", 5)]);
-        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, Vec::new()));
+        model.tracker.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, Vec::new()));
         let screen = render(&model, 40);
         let line = &row(&screen, &Key::Pr(pr("e2e", 5).url())).line;
         let shown = text(line);
@@ -798,13 +697,13 @@ mod tests {
     #[test]
     fn expanded_prs_list_their_commits_and_expanded_commits_their_files() {
         let mut model = fixture(&["e2e"], &[pr("e2e", 5)]);
-        model.commits.insert(root("e2e"), commits(12));
+        model.tracker.commits.insert(root("e2e"), commits(12));
         let held = vec![gh("h3", "gh 3", 3), gh("h7", "gh 7", 7), gh("x1", "someone else's", 8)];
-        model.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, held));
+        model.tracker.pr_views.insert(pr("e2e", 5).url(), view(PrState::Open, held));
         model.expanded.insert(pr("e2e", 5).url());
         model.expanded.insert("h7".into());
         let stat = LineStat::Lines { added: 1, removed: 0 };
-        model.commit_files.insert("h7".into(), Ok(vec![FileChange { code: 'M', path: "a.py".into(), stat }]));
+        model.tracker.commit_files.insert("h7".into(), Ok(vec![FileChange { code: 'M', path: "a.py".into(), stat }]));
         let screen = render(&model, 40);
         // All the PR's commits, newest first: the chat's own marked green, others dim; the
         // expanded commit's files under it, each with its diff in the commit.
@@ -870,7 +769,7 @@ mod tests {
         let mut model = fixture(&["app"], &[pr("app", 7)]);
         session(&mut model).title = "chat".into();
         let change = |path: &str| Change { code: *b" M", path: path.into(), orig: None, stat: None };
-        model.statuses.insert(root("app"), Ok(RepoStatus { changes: vec![change("a.rs"), change("b.rs")], ..clean() }));
+        model.tracker.statuses.insert(root("app"), Ok(RepoStatus { changes: vec![change("a.rs"), change("b.rs")], ..clean() }));
         // Title, blank, repo header, two files, the PR: six rows for five.
         let screen = render(&model, 40);
         let shown_keys = |view: &View| view.rows.iter().filter_map(|r| r.click.as_ref().map(Click::key)).collect::<Vec<_>>();

@@ -1,12 +1,11 @@
-//! Plugin-owned files under `HERDR_PLUGIN_STATE_DIR`: which tab holds which sidebar pane, the
-//! repos and pull requests of each agent chat session, and each sidebar's diff request.
+//! Files under `HERDR_PLUGIN_STATE_DIR`: the repos and pull requests of each agent chat session,
+//! shared by every frontend; frontends keep their own files beside them.
 
-use crate::github::PrRef;
-use anyhow::{Context, Result};
+use crate::engine::github::PrRef;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
@@ -17,7 +16,7 @@ pub fn state_dir() -> PathBuf {
 }
 
 /// Writes the file whole or not at all (through a temporary file), creating its directory.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -25,34 +24,6 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-/// Exclusive hold on the dock state; concurrent hooks serialize on `dock.lock`.
-pub struct DockGuard {
-    _lock: File,
-    path: PathBuf,
-    /// Sidebar pane id per tab id.
-    pub tabs: BTreeMap<String, String>,
-}
-
-impl DockGuard {
-    pub fn acquire() -> Result<Self> {
-        let dir = state_dir();
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let lock = File::create(dir.join("dock.lock"))?;
-        lock.lock()?;
-        let path = dir.join("dock.json");
-        let tabs = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|mut v| serde_json::from_value(v["tabs"].take()).ok())
-            .unwrap_or_default();
-        Ok(Self { _lock: lock, path, tabs })
-    }
-
-    pub fn save(&self) -> Result<()> {
-        write_atomic(&self.path, &serde_json::to_vec_pretty(&serde_json::json!({ "tabs": self.tabs }))?)
-    }
 }
 
 /// What one agent chat session keeps: the repos it touched, in first-touch order, the PRs it
@@ -176,7 +147,7 @@ pub struct RepoRecord {
 
 /// A session key or pane id as a file name in `dir`: other characters than ASCII letters,
 /// digits, `-`, `_` and `.` become `_`, and long keys keep their end.
-fn keyed_file(dir: &str, key: &str) -> PathBuf {
+pub fn keyed_file(dir: &str, key: &str) -> PathBuf {
     let name: String = key
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
@@ -187,11 +158,6 @@ fn keyed_file(dir: &str, key: &str) -> PathBuf {
 
 fn session_file(key: &str) -> PathBuf {
     keyed_file("sessions", key)
-}
-
-/// The request file of the diff pane belonging to `sidebar_pane`.
-pub fn request_file(sidebar_pane: &str) -> PathBuf {
-    keyed_file("diff", sidebar_pane)
 }
 
 pub fn load_session(key: &str) -> SessionState {
@@ -206,26 +172,24 @@ pub fn save_session(state: &SessionState) -> Result<()> {
 }
 
 /// Session files untouched for this long belong to chats that are over.
-const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Deletes plugin files nothing uses any more: diff requests of panes that are gone, and
-/// session files of chats untouched for 30 days that no open pane belongs to.
-pub fn prune(live_panes: &[&str], live_sessions: &[&str]) -> Result<usize> {
-    let keep_diffs: Vec<PathBuf> = live_panes.iter().map(|p| request_file(p)).collect();
-    let keep_sessions: Vec<PathBuf> = live_sessions.iter().map(|s| session_file(s)).collect();
+/// Deletes the session files of chats untouched for 30 days, but those of `live_sessions`.
+pub fn prune_sessions(live_sessions: &[&str]) -> Result<usize> {
+    let keep: Vec<PathBuf> = live_sessions.iter().map(|s| session_file(s)).collect();
+    prune_files(&state_dir().join("sessions"), &keep, Some(SESSION_TTL))
+}
+
+/// Deletes the files in `dir` but `keep`; with `ttl`, only those untouched for that long.
+pub fn prune_files(dir: &Path, keep: &[PathBuf], ttl: Option<Duration>) -> Result<usize> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(0) };
     let mut removed = 0;
-    for (dir, keep, stale) in [
-        (state_dir().join("diff"), keep_diffs, None),
-        (state_dir().join("sessions"), keep_sessions, Some(SESSION_TTL)),
-    ] {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let old = |ttl| entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > ttl));
-            if !keep.contains(&path) && stale.is_none_or(old) {
-                std::fs::remove_file(&path)?;
-                removed += 1;
-            }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let old = |ttl| entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > ttl));
+        if !keep.contains(&path) && ttl.is_none_or(old) {
+            std::fs::remove_file(&path)?;
+            removed += 1;
         }
     }
     Ok(removed)

@@ -1,16 +1,7 @@
-mod ansi;
-mod diff;
-mod dock;
-mod git;
-mod github;
-mod herdr;
-mod repos;
-mod sidebar;
-mod state;
-mod transcript;
-mod term;
+mod classic;
 
-pub const PLUGIN_ID: &str = "kjozsa.tracks";
+use classic::{diff, dock, sidebar};
+
 /// Manifest `[[panes]]` ids.
 pub const SIDEBAR_ENTRYPOINT: &str = "sidebar";
 pub const DIFF_ENTRYPOINT: &str = "diff";

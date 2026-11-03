@@ -5,77 +5,30 @@
 //! This module holds the state, the event loop and input handling; [`collect`] gathers the
 //! data and [`render`] lays it out and draws it.
 
-mod collect;
 mod render;
+mod source;
 
-use crate::diff::{self, CommitAt, DiffRequest};
-use crate::git::{Change, Commit, FileChange, RepoStatus};
-use crate::github::{PrRef, PrView};
-use crate::herdr;
-use crate::state::{self, Dismissal, SessionState};
-use crate::transcript::Transcript;
+use crate::classic::diff;
+use crate::classic::{dock, herdr, term};
 use anyhow::{anyhow, Context, Result};
-use collect::PrBatch;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal;
+use herdr_tracks::engine::git::Change;
+use herdr_tracks::engine::patch::{CommitAt, DiffRequest};
+use herdr_tracks::engine::{Target, Tracker};
 use render::{Row, Screen};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const SAMPLE_EVERY: Duration = Duration::from_secs(1);
-const GIT_EVERY: Duration = Duration::from_secs(5);
-const PR_EVERY: Duration = Duration::from_secs(30);
 /// Links scrolled per mouse-wheel notch.
 const WHEEL_LINKS: usize = 3;
 
-/// Which chat session the sidebar follows, and whether its repo set is persisted.
-struct Session {
-    pane_id: String,
-    title: String,
-    saved: SessionState,
-    persisted: bool,
-    /// Transcript being tailed (omp, Claude Code); other agents rely on process working dirs only.
-    transcript: Option<Transcript>,
-    /// Web links the chat mentioned, newest first; rebuilt from the transcript on start.
-    links: Vec<String>,
-    /// The chat's finished tool calls, as (start, end) unix milliseconds; rebuilt from the
-    /// transcript on start. Commits made within them are the chat's.
-    calls: Vec<(i64, i64)>,
-}
-
-impl Session {
-    /// Writes what the chat keeps to its session file, when it has one.
-    fn save(&self) -> Result<()> {
-        if self.persisted {
-            state::save_session(&self.saved)?;
-        }
-        Ok(())
-    }
-}
-
-/// `git status` of each shown repo.
-type Statuses = HashMap<PathBuf, Result<RepoStatus, String>>;
-
+/// What the sidebar shows (the [`Tracker`]'s), and how.
 #[derive(Default)]
 struct Model {
-    session: Option<Session>,
-    statuses: Statuses,
-    /// Commits the chat made, per repo, newest first.
-    commits: HashMap<PathBuf, Vec<Commit>>,
-    /// Each pull request as last fetched, by URL: its status and title, and its commits, merge
-    /// commit and last activity: the chat's commits among them are listed under the pull
-    /// request, which sorts by the newest of them.
-    pr_views: HashMap<String, PrView>,
-    error: Option<String>,
-    /// github.com `owner/repo` slugs of each checkout's remotes.
-    remotes: HashMap<PathBuf, Vec<String>>,
-    /// Last `gh` failure per PR URL.
-    pr_errors: HashMap<String, String>,
-    /// In-flight PR status refresh (runs `gh` off the UI thread).
-    pr_job: Option<Receiver<PrBatch>>,
+    tracker: Tracker,
     /// The diff pane currently shown; the next diff replaces it.
     diff_pane: Option<String>,
     /// Row chosen with the arrow keys or a click; its diff is shown.
@@ -83,10 +36,6 @@ struct Model {
     /// Pull requests (by URL) expanded to list their commits, and commits (by hash) expanded
     /// to list their files.
     expanded: HashSet<String>,
-    /// Files of expanded commits, by hash; absent while loading.
-    commit_files: HashMap<String, Result<Vec<FileChange>, String>>,
-    /// In-flight file list fetches (run `git` or `gh` off the UI thread).
-    files_jobs: Vec<Receiver<FilesFetched>>,
     /// This sidebar's own pane id; names the request file its diff viewer follows.
     me: String,
     /// First rendered row on screen when the list is taller than the pane.
@@ -102,20 +51,8 @@ struct Model {
     /// kept in view). A clicked row needs no marking.
     keyboard: bool,
     /// The width to keep: a dragged one, or herdr's left-sidebar width.
-    width: crate::dock::WidthHold,
+    width: dock::WidthHold,
 }
-
-impl Model {
-    /// Shows a failure on the sidebar's first row; the loop keeps running.
-    fn note(&mut self, result: Result<()>) {
-        if let Err(e) = result {
-            self.error = Some(format!("{e:#}"));
-        }
-    }
-}
-
-/// A commit's file list, fetched in the background, by hash.
-type FilesFetched = (String, Result<Vec<FileChange>, String>);
 
 /// What a sidebar row is: selecting or clicking it shows its diff.
 #[derive(Debug, Clone, PartialEq)]
@@ -174,16 +111,6 @@ impl Click {
     }
 }
 
-/// What a right-click menu acts on: a repo header, a pull request row, a link, or the links
-/// block's rule.
-#[derive(Debug, Clone, PartialEq)]
-enum Target {
-    Repo(PathBuf),
-    Pr(PrRef),
-    Link(String),
-    Links,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MenuItem {
     /// Open the pull request or link in the browser.
@@ -220,27 +147,18 @@ pub fn run() -> Result<()> {
     let me = std::env::var("HERDR_PANE_ID").map_err(|_| anyhow!("HERDR_PANE_ID not set"))?;
     // herdr shows its own pane menu on right-click unless the pane asks for the clicks.
     herdr::forward_right_click(&me)?;
-    let _term = crate::term::Term::enter()?;
+    let _term = term::Term::enter()?;
     event_loop(&me)
-}
-
-/// When each kind of data is next refreshed.
-struct Due {
-    sample: Instant,
-    git: Instant,
-    pr: Instant,
 }
 
 /// Runs for the pane's lifetime. There is no quit key: the sidebar is mandatory.
 fn event_loop(me: &str) -> Result<()> {
     let mut model = Model { me: me.to_string(), ..Model::default() };
-    let watched = crate::dock::watch_width(me, &mut model.width);
-    model.note(watched);
+    let watched = dock::watch_width(me, &mut model.width);
+    model.tracker.note(watched);
     let mut shown: (Vec<Row>, Option<usize>, Option<String>) = (Vec::new(), None, None);
-    let now = Instant::now();
-    let mut due = Due { sample: now, git: now, pr: now };
     loop {
-        refresh(&mut model, &mut due);
+        refresh(&mut model);
         let (cols, rows) = terminal::size()?;
         let (cols, rows) = (usize::from(cols), usize::from(rows));
         let screen = render::render(&model, cols);
@@ -258,68 +176,27 @@ fn event_loop(me: &str) -> Result<()> {
             render::draw(&view, cols, model.hover.as_deref())?;
             shown = (view.rows.clone(), view.highlight, model.hover.clone());
         }
-        if event::poll(due.sample.min(due.git).saturating_duration_since(Instant::now()))? {
+        if event::poll(model.tracker.next_due().saturating_duration_since(Instant::now()))? {
             let event = event::read()?;
             if matches!(event, Event::Resize(..)) {
                 shown = (Vec::new(), None, None);
             }
             let result = handle_event(&mut model, &screen, &view, rows, event);
-            model.note(result);
+            model.tracker.note(result);
         }
     }
 }
 
-/// Refreshes whatever is due: the followed chat (every second), git status (every 5 s, or
-/// at once when new repos appear), pull-request status (every 30 s, or at once when a PR has
-/// not been fetched yet) and fetched file lists.
-fn refresh(model: &mut Model, due: &mut Due) {
-    let now = Instant::now();
-    if now >= due.sample {
-        due.sample = now + SAMPLE_EVERY;
+/// Refreshes the tracker, following the agent pane of this sidebar's tab.
+fn refresh(model: &mut Model) {
+    let Model { tracker, diff_pane, selected, me, .. } = model;
+    tracker.refresh(|previous| {
         // A diff pane closed from its own side (`q`, or herdr) leaves nothing selected.
-        if model.diff_pane.as_deref().is_some_and(|pane| !herdr::pane_exists(pane)) {
-            model.diff_pane = None;
-            model.selected = None;
+        if diff_pane.as_deref().is_some_and(|pane| !herdr::pane_exists(pane)) {
+            *diff_pane = None;
+            *selected = None;
         }
-        let me = model.me.clone();
-        match collect::sample(&me, model) {
-            Ok(new_repos) => {
-                model.error = None;
-                if new_repos {
-                    due.git = now;
-                }
-            }
-            Err(e) => model.note(Err(e)),
-        }
-    }
-    if now >= due.git {
-        due.git = now + GIT_EVERY;
-        (model.statuses, model.commits) = collect::refresh_git(model);
-        let result = collect::track_changes(model);
-        model.note(result);
-    }
-    if let Some(job) = &model.pr_job {
-        match job.try_recv() {
-            Ok(batch) => {
-                model.pr_job = None;
-                collect::apply_prs(model, batch);
-            }
-            Err(TryRecvError::Disconnected) => model.pr_job = None,
-            Err(TryRecvError::Empty) => {}
-        }
-    }
-    if model.pr_job.is_none() && (now >= due.pr || collect::has_unfetched_pr(model)) {
-        due.pr = now + PR_EVERY;
-        model.pr_job = collect::start_pr_refresh(model);
-    }
-    let Model { files_jobs, commit_files, .. } = model;
-    files_jobs.retain(|job| match job.try_recv() {
-        Ok((hash, files)) => {
-            commit_files.insert(hash, files);
-            false
-        }
-        Err(TryRecvError::Empty) => true,
-        Err(TryRecvError::Disconnected) => false,
+        source::find(me, previous)
     });
 }
 
@@ -361,7 +238,7 @@ fn handle_event(model: &mut Model, screen: &Screen, view: &render::View, rows: u
         }
         (menu, Event::Resize(..)) => {
             model.menu = menu;
-            crate::dock::hold_width(&model.me, &mut model.width)
+            dock::hold_width(&model.me, &mut model.width)
         }
         // The wheel over the links block scrolls it (and closes a menu anchored to its rows).
         (_, Event::Mouse(MouseEvent { kind: kind @ (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp), row, .. }))
@@ -435,7 +312,7 @@ fn handle_key(model: &mut Model, screen: &Screen, code: KeyCode) -> Result<()> {
             }
             _ => Ok(()),
         },
-        KeyCode::Char('C') => dismiss(model, &Target::Links),
+        KeyCode::Char('C') => model.tracker.dismiss(&Target::Links),
         KeyCode::Char('o') => match selected.and_then(|c| c.url()) {
             Some(url) => open_url(&url),
             None => Ok(()),
@@ -477,16 +354,7 @@ fn move_selection(model: &mut Model, screen: &Screen, step: isize) -> Option<Dif
 /// Lists a commit's files under it, fetching them in the background the first time.
 fn expand_commit(model: &mut Model, commit: &CommitAt) {
     model.expanded.insert(commit.hash.clone());
-    if model.commit_files.contains_key(&commit.hash) {
-        return;
-    }
-    let (tx, rx) = mpsc::channel();
-    let commit = commit.clone();
-    std::thread::spawn(move || {
-        let files = commit.files();
-        let _ = tx.send((commit.hash, files));
-    });
-    model.files_jobs.push(rx);
+    model.tracker.fetch_files(commit);
 }
 
 fn run_menu(model: &mut Model, target: &Target, item: MenuItem) -> Result<()> {
@@ -494,26 +362,9 @@ fn run_menu(model: &mut Model, target: &Target, item: MenuItem) -> Result<()> {
         (MenuItem::Open, Target::Pr(pr)) => open_url(&pr.url()),
         (MenuItem::Open, Target::Link(url)) => open_url(url),
         (MenuItem::Open, Target::Repo(_) | Target::Links) => Ok(()),
-        (MenuItem::Dismiss, target) => dismiss(model, target),
-        (MenuItem::DismissAllLinks, _) => dismiss(model, &Target::Links),
+        (MenuItem::Dismiss, target) => model.tracker.dismiss(target),
+        (MenuItem::DismissAllLinks, _) => model.tracker.dismiss(&Target::Links),
     }
-}
-
-/// Hides a pull request from this chat's sidebar for good, a repo (with its pull requests)
-/// until the chat touches it again, or a link (or all of them) until the chat mentions it again.
-fn dismiss(model: &mut Model, target: &Target) -> Result<()> {
-    let Some(session) = model.session.as_mut() else { return Ok(()) };
-    let at = session.transcript.as_ref().map_or(0, Transcript::position);
-    let what = match target {
-        Target::Repo(root) => Dismissal::Repo(root),
-        Target::Pr(pr) => Dismissal::Pr(pr),
-        Target::Link(url) => Dismissal::Links(std::slice::from_ref(url)),
-        Target::Links => Dismissal::Links(&session.links),
-    };
-    if session.saved.dismiss(what, at) {
-        session.save()?;
-    }
-    Ok(())
 }
 
 /// Opens the URL in the desktop's browser without waiting for it.
@@ -564,66 +415,33 @@ fn handle_select(model: &mut Model, click: &Click) -> Result<()> {
 /// Shows a diff without taking focus from the sidebar: points the running diff viewer at it
 /// (it redraws in place), or opens the viewer next to the agent.
 fn show_diff(model: &mut Model, request: &DiffRequest) -> Result<()> {
-    let file = state::request_file(&model.me);
-    state::write_atomic(&file, &serde_json::to_vec(request)?)?;
+    let file = diff::request_file(&model.me);
+    herdr_tracks::engine::state::write_atomic(&file, &serde_json::to_vec(request)?)?;
     if model.diff_pane.as_deref().is_some_and(herdr::pane_exists) {
         return Ok(());
     }
-    let agent = model.session.as_ref().map(|s| s.pane_id.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
+    let agent = model.tracker.session.as_ref().map(|s| s.pane.clone()).ok_or_else(|| anyhow!("no agent pane"))?;
     let env = [(diff::ENV, file.display().to_string()), (diff::OWNER_ENV, model.me.clone())];
     model.diff_pane =
-        Some(herdr::open_plugin_pane(crate::PLUGIN_ID, crate::DIFF_ENTRYPOINT, &agent, false, &env)?);
+        Some(herdr::open_plugin_pane(herdr_tracks::PLUGIN_ID, crate::DIFF_ENTRYPOINT, &agent, false, &env)?);
     Ok(())
 }
 
 #[cfg(test)]
 mod fixture {
-    use super::*;
-    use crate::github::{PrCommit, PrState, PrStatus};
-    use crate::state::{PrRecord, RepoRecord};
     use super::render::Line;
+    use super::Model;
+    use herdr_tracks::engine::{fixture, Session};
 
-    pub(super) fn root(name: &str) -> PathBuf {
-        PathBuf::from(format!("/r/{name}"))
-    }
+    pub(super) use herdr_tracks::engine::fixture::{clean, gh, pr, root, view};
 
-    pub(super) fn pr(repo: &str, number: u32) -> PrRef {
-        PrRef { owner: "o".into(), repo: repo.into(), number }
-    }
-
-    /// A clean checkout of `main`.
-    pub(super) fn clean() -> RepoStatus {
-        RepoStatus { branch: "main".into(), ahead: 0, behind: 0, changes: Vec::new(), fingerprint: 0 }
-    }
-
-    /// Following a chat (not persisted) that changed the repos named (each [`root`], a
-    /// [`clean`] checkout) and named the PRs, each under its repo's checkout when that is one of
-    /// the repos.
-    pub(super) fn fixture(repos: &[&str], prs: &[PrRef]) -> Model {
-        let mut model = Model::default();
-        for name in repos {
-            model.statuses.insert(root(name), Ok(clean()));
-        }
-        let records = repos.iter().map(|name| RepoRecord { root: root(name), changed: true, baseline: None }).collect();
-        let prs = prs.iter().map(|p| PrRecord { pr: p.clone(), root: repos.contains(&p.repo.as_str()).then(|| root(&p.repo)) });
-        let saved = SessionState { key: "s".into(), repos: records, prs: prs.collect(), ..SessionState::default() };
-        let (title, links, calls) = (String::new(), Vec::new(), Vec::new());
-        model.session = Some(Session { pane_id: "w:p1".into(), title, saved, persisted: false, transcript: None, links, calls });
-        model
+    /// A sidebar following [`fixture::fixture`]'s chat.
+    pub(super) fn fixture(repos: &[&str], prs: &[herdr_tracks::engine::github::PrRef]) -> Model {
+        Model { tracker: fixture::fixture(repos, prs), ..Model::default() }
     }
 
     pub(super) fn session(model: &mut Model) -> &mut Session {
-        model.session.as_mut().expect("fixture follows a chat")
-    }
-
-    /// A fetched pull request without checks, active on GitHub at time 1.
-    pub(super) fn view(state: PrState, commits: Vec<PrCommit>) -> PrView {
-        let title = "lodge every beneficial owner as owner too".into();
-        PrView { status: PrStatus { state, checks: None }, title, head: "feature".into(), commits, merge: None, updated: Some(1) }
-    }
-
-    pub(super) fn gh(oid: &str, subject: &str, time: i64) -> PrCommit {
-        PrCommit { oid: oid.into(), subject: Some(subject.into()), time: Some(time) }
+        fixture::session(&mut model.tracker)
     }
 
     pub(super) fn text(line: &Line) -> String {
@@ -635,13 +453,14 @@ mod fixture {
 mod tests {
     use super::*;
     use super::fixture::{clean, fixture, pr, root, session};
+    use herdr_tracks::engine::git::RepoStatus;
     use super::render::{links, render, window};
 
     #[test]
     fn arrows_walk_the_selectable_rows_and_stop_at_the_ends() {
         let change = |path: &str| Change { code: *b" M", path: path.into(), orig: None, stat: None };
         let mut model = fixture(&["app"], &[pr("app", 7)]);
-        model.statuses.insert(root("app"), Ok(RepoStatus { changes: vec![change("a.rs"), change("b.rs")], ..clean() }));
+        model.tracker.statuses.insert(root("app"), Ok(RepoStatus { changes: vec![change("a.rs"), change("b.rs")], ..clean() }));
         let screen = render(&model, 40);
         // The repo header comes first: it shows all uncommitted changes.
         assert_eq!(move_selection(&mut model, &screen, 1), Some(DiffRequest::Worktree { root: root("app") }));

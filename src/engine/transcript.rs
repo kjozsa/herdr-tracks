@@ -2,7 +2,7 @@
 //! Claude Code: `~/.claude/projects/*/<session>.jsonl`): extracts the paths and working
 //! directories of the agent's tool calls, and the pull requests its `gh pr create` calls opened.
 
-use crate::github::{self, PrRef};
+use crate::engine::github::{self, PrRef};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;

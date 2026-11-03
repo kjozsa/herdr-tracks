@@ -318,7 +318,7 @@ pub(crate) fn git(root: &Path) -> Command {
 }
 
 /// What the git command prints, when it succeeds.
-pub(crate) fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+pub fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
     let out = git(root).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }

@@ -1,7 +1,7 @@
 //! GitHub pull requests: recognising PR URLs, matching them to local checkouts by remote,
 //! and reading state + CI rollup through the `gh` CLI.
 
-use crate::git::{self, FileChange, LineStat};
+use crate::engine::git::{self, FileChange, LineStat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -151,7 +151,7 @@ pub fn pr_view(pr: &PrRef) -> Result<PrView, String> {
 }
 
 fn parse_view(json: &Value) -> PrView {
-    let secs = |v: &Value| v.as_str().and_then(crate::transcript::unix_ms).map(|ms| ms / 1000);
+    let secs = |v: &Value| v.as_str().and_then(crate::engine::transcript::unix_ms).map(|ms| ms / 1000);
     let commits = json["commits"].as_array().into_iter().flatten().filter_map(|c| {
         Some(PrCommit {
             oid: c["oid"].as_str()?.to_string(),
