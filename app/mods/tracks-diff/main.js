@@ -110,7 +110,10 @@ export default class TracksDiff extends View {
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const r = await execFile(BIN, ["app", "patch", key]);
+        // A remote tab's id is `<machine>/<tab>`: its repos are there.
+        const tab = String(props()?.tab ?? "");
+        const on = tab.includes("/") ? tab.slice(0, tab.indexOf("/")) : null;
+        const r = await execFile(BIN, ["app", "patch", key], { on });
         if (this.key !== key) return;
         if (r.code !== 0) { this.error = r.stderr.trim() || "no diff"; this.rows = []; this.text = null; }
         else {

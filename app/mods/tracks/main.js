@@ -26,15 +26,22 @@ function open(url) {
   execFile("xdg-open", [url]).catch(() => {});
 }
 
+// A remote terminal's address is `<machine>/<terminal>`: its serve, files and diffs are there.
+export function machineOf(address) {
+  const i = address ? address.indexOf("/") : -1;
+  return i < 0 ? { on: null, local: address ?? null } : { on: address.slice(0, i), local: address.slice(i + 1) };
+}
+
 function send(terminal, command) {
-  return execFile(BIN, ["app", "send", terminal, JSON.stringify(command)]);
+  const { on, local } = machineOf(terminal);
+  return execFile(BIN, ["app", "send", local, JSON.stringify(command)], { on });
 }
 
 // The tab's agent to follow: the focused one, else the one followed so far, else the first.
 function followed(previous) {
   const f = focused();
   if (!f) return null;
-  const mine = agents().filter((a) => a.tab === f.tab && !a.address.includes("/"));
+  const mine = agents().filter((a) => a.tab === f.tab);
   return mine.find((a) => a.address === f.terminal) ?? mine.find((a) => a.address === previous) ?? mine[0] ?? null;
 }
 
@@ -69,7 +76,9 @@ const CHECKS = { passing: ["✓", "ansi2"], failing: ["✗", "ansi1"], pending: 
 export default class Tracks extends View {
   init(_props, cx) {
     if (props()?.menu) return;
-    this.dir = null;
+    // Per machine ("" for this one): where its serve writes the models, and why it can't.
+    this.dirs = new Map();
+    this.errors = new Map();
     this.model = null;
     this.text = null;
     this.agent = null;
@@ -81,21 +90,28 @@ export default class Tracks extends View {
     cx.timer.every(2000, (cx) => this.reload(cx));
   }
 
-  // Keeps `serve` running; learns where it writes, and follows its writes.
+  // The followed agent's machine, "" for this one.
+  machine() {
+    return machineOf(this.agent?.address).on ?? "";
+  }
+
+  // Keeps `serve` running on the followed agent's machine; learns where it writes, and follows
+  // its writes (watched here, polled by the reload timer elsewhere).
   ensure(cx) {
+    const m = this.machine();
     cx.spawn(async (cx) => {
       try {
-        const r = await execFile(BIN, ["app", "ensure"]);
+        const r = await execFile(BIN, ["app", "ensure"], { on: m || null });
         if (r.code !== 0) throw new Error(r.stderr.trim() || `${BIN} app ensure failed`);
         const dir = r.stdout.trim();
-        this.error = null;
-        if (dir !== this.dir) {
-          this.dir = dir;
+        this.errors.delete(m);
+        if (dir !== this.dirs.get(m)) {
+          this.dirs.set(m, dir);
           this.reload(cx);
-          this.watch(dir, cx);
+          if (!m) this.watch(dir, cx);
         }
       } catch (e) {
-        this.error = String(e);
+        this.errors.set(m, m ? `${m}: ${e}` : String(e));
         cx.notify();
       }
     });
@@ -104,7 +120,7 @@ export default class Tracks extends View {
   watch(dir, cx) {
     cx.spawn(async (cx) => {
       try {
-        while (this.dir === dir) {
+        while (this.dirs.get("") === dir) {
           await watchFolder(dir);
           this.reload(cx);
         }
@@ -122,13 +138,16 @@ export default class Tracks extends View {
       this.expanded = new Set();
       this.selected = null;
       if (notify) cx.notify();
+      if (agent && !this.dirs.has(this.machine())) this.ensure(cx);
     } else {
       this.agent = agent;
     }
-    if (!this.dir || !agent) return;
+    const dir = this.dirs.get(this.machine());
+    if (!dir || !agent) return;
     const address = agent.address;
+    const { on, local } = machineOf(address);
     cx.spawn(async (cx) => {
-      const text = await readTextFile(`${this.dir}/${address}.json`).catch(() => null);
+      const text = await readTextFile(`${dir}/${local}.json`, { on }).catch(() => null);
       if (this.agent?.address !== address || text === this.text) return;
       this.text = text;
       try { this.model = text ? JSON.parse(text) : null; } catch { this.model = null; }
@@ -261,10 +280,11 @@ export default class Tracks extends View {
     const m = this.model;
     const rows = [];
     const note = (text, color = t.dim) => rows.push(this.row(`note-${rows.length}`, t).child(div().truncate().text_color(color).child(text)));
-    if (this.error) note(this.error, t.ansi1);
+    const error = this.errors.get(this.machine());
+    if (error) note(error, t.ansi1);
     if (m?.error) note(`! ${m.error}`, t.ansi1);
     if (!agent) note("no agent in this tab");
-    else if (!m) note(this.dir ? "…" : "starting…");
+    else if (!m) note(this.dirs.has(this.machine()) ? "…" : "starting…");
     else {
       if (!m.repos.length && !m.orphans.length) note("no changes yet");
       for (const repo of m.repos) rows.push(...this.repoRows(repo, t));
