@@ -6,14 +6,25 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 // herdr's exec takes an argv array and runs no shell, like execFile.
-import { agents, focused, panes, exec as execFile, readTextFile, watchFolder, theme, run, setShared, openOverlay, closeOverlay, props } from "herdr";
+import { agents, focused, panes, settings, exec as execFile, readTextFile, watchFolder, theme, run, setShared, openOverlay, closeOverlay, props } from "herdr";
 
 const BIN = "herdr-tracks";
 // Commits listed per repo and per pull request; older ones are counted on one more row.
 const COMMITS_SHOWN = 10;
 // Rows and icons as in Herdr's own Files, Changes and Spaces views.
-const ROW = 28;
+const ROW = 30;
 const INDENT = 18;
+// Pastel bars per repo, tinted like the labeled Spaces view: [rest, hover] alpha.
+const PASTELS = ["#f5c2e7", "#a6e3a1", "#89b4fa", "#f9e2af", "#cba6f7", "#94e2d5", "#fab387", "#f38ba8", "#b4befe", "#89dceb"];
+const BAR_TINT = { dark: ["47", "61"], light: ["7a", "a0"] };
+const NAME_DIM = 0.22;
+const pastel = (name) => PASTELS[[...name].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7) % PASTELS.length];
+function mix(a, b, k) {
+  const rgb = (h) => /^#[0-9a-f]{6}/i.test(h ?? "") ? [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)) : null;
+  const x = rgb(a), y = rgb(b);
+  if (!x || !y) return a;
+  return "#" + x.map((v, i) => Math.round(v + (y[i] - v) * k).toString(16).padStart(2, "0")).join("");
+}
 const ICON = (name) => `mods/workspace-chrome/${name}.svg`;
 const CHEVRON = (open) => `mods/files/chevron-${open ? "down" : "right"}.svg`;
 // Link rows in view; more scroll.
@@ -86,6 +97,7 @@ export default class Tracks extends View {
     // Pull requests (by URL) expanded into their commits, commits (by hash) into their files.
     this.expanded = new Set();
     this.selected = null;
+    try { this.folded = new Set(JSON.parse(localStorage.getItem("repos.folded") ?? "[]")); } catch { this.folded = new Set(); }
     this.ensure(cx);
     cx.timer.every(60000, (cx) => this.ensure(cx));
     cx.timer.every(2000, (cx) => this.reload(cx));
@@ -176,8 +188,10 @@ export default class Tracks extends View {
   }
 
   row(id, t, selected, depth = 0) {
-    return h_flex().id(id).h(ROW).flex_none().pl(8 + depth * INDENT).pr(8).gap(7).items_center().rounded(7)
-      .when(selected, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover));
+    return h_flex().relative().id(id).h(ROW).flex_none().pl(8 + Math.max(0, depth - 1) * INDENT).pr(8).gap(9).items_center().rounded(8)
+      .when(selected, (e) => e.bg(mix(t.selected, t.chrome, 0.45)).text_color(t.foreground)
+        .child(div().absolute().left(0).top(6).bottom(6).w(3).rounded(2).bg(t.accent)))
+      .when(!selected, (e) => e.hover((s) => s.bg(t.hover)));
   }
 
   chevron(id, open, toggle, t) {
@@ -188,7 +202,7 @@ export default class Tracks extends View {
 
   // "src/app/" dim before the name, as the Changes view shows a path.
   path(text, t) {
-    const cut = text.includes(" → ") ? -1 : text.lastIndexOf("/");
+    const cut = text.includes(" → ") ? -1 : text.replace(/\/$/, "").lastIndexOf("/");
     return h_flex().flex_1().min_w(0)
       .when(cut >= 0, (e) => e.child(div().min_w(0).flex_shrink(1).truncate().text_color(t.dim).child(text.slice(0, cut + 1))))
       .child(div().min_w(0).flex_shrink(0).max_w(260).truncate().child(text.slice(cut + 1)));
@@ -202,20 +216,37 @@ export default class Tracks extends View {
     return this.row(id, t, false, depth).child(div().pl(23).truncate().text_size(12).text_color(t.dim).child(text));
   }
 
-  head(id, t, name, selected) {
-    return this.row(id, t, selected).child(svg(ICON("folder")).size(14).flex_none().text_color(t.muted))
-      .child(div().flex_none().font_semibold().child(name));
+  // A bar like a label's in the Spaces view; a click folds it.
+  head(id, t, name, key, first) {
+    const dark = settings().dark !== false;
+    const c = pastel(name), tint = BAR_TINT[dark ? "dark" : "light"], ink = dark ? c : t.foreground;
+    const folded = this.folded.has(key);
+    return h_flex().id(id).h(26).flex_none().when(!first, (e) => e.mt(6)).px(8).gap(7).items_center().text_size(12).font_bold()
+      .rounded(7).bg(`${c}${tint[0]}`).text_color(ink).cursor_pointer().hover((s) => s.bg(`${c}${tint[1]}`))
+      .on_click((_e, cx) => {
+        if (!this.folded.delete(key)) this.folded.add(key);
+        try { localStorage.setItem("repos.folded", JSON.stringify([...this.folded])); } catch {}
+        cx.notify();
+      })
+      .child(svg(ICON("folder")).size(13).flex_none())
+      .child(div().flex_none().max_w(160).truncate().child(name));
   }
 
   repoRows(repo, t, first) {
     const rows = [];
-    rows.push(this.head(`repo-${repo.root}`, t, repo.name, this.selected === repo.root).when(!first, (e) => e.mt(8)).cursor_pointer()
-      .on_click(() => this.select(repo.root, repo.diff))
+    const folded = this.folded.has(repo.root);
+    const tint = BAR_TINT[settings().dark !== false ? "dark" : "light"][1];
+    rows.push(this.head(`repo-${repo.root}`, t, repo.name, repo.root, first)
       .on_mouse_down("right", () => this.menu([["Dismiss repo", { dismiss: { repo: repo.root } }]]))
-      .child(h_flex().flex_1().min_w(0).gap(5).justify_end().items_center().text_size(11.5).text_color(t.dim)
+      .child(h_flex().flex_1().min_w(0).gap(5).justify_end().items_center().font_normal().text_size(11.5)
         .when(Boolean(repo.branch), (e) => e.child(svg(ICON("git-branch")).size(12).flex_none()).child(div().min_w(0).truncate().child(repo.branch)))
         .when(repo.ahead > 0, (e) => e.child(div().flex_none().text_color(t.ansi2).child(`↑${repo.ahead}`)))
-        .when(repo.behind > 0, (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${repo.behind}`)))));
+        .when(repo.behind > 0, (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${repo.behind}`))))
+      .child(div().id(`repo-diff-${repo.root}`).flex_none().p(3).rounded(4).hover((s) => s.bg(`${pastel(repo.name)}${tint}`))
+        .tooltip("Show all changes").on_click((_e, cx) => { cx.stop_propagation(); this.select(repo.root, repo.diff); cx.notify(); })
+        .child(svg(ICON("git-compare")).size(12)))
+      .child(svg(CHEVRON(!folded)).size(11).flex_none()));
+    if (folded) return rows;
     if (repo.error) rows.push(this.row(`repo-err-${repo.root}`, t, false, 1).child(div().truncate().text_size(12).text_color(t.ansi1).child(repo.error)));
     for (const c of repo.changes ?? []) {
       const key = `${repo.root}:${c.path}`;
@@ -317,24 +348,30 @@ export default class Tracks extends View {
     else {
       if (!m.repos.length && !m.orphans.length) note("No changes yet");
       m.repos.forEach((repo, i) => rows.push(...this.repoRows(repo, t, i === 0)));
+      const heads = new Set();
       for (const pr of m.orphans) {
-        rows.push(this.head(`orphan-${pr.url}`, t, pr.repo).when(rows.length > 0, (e) => e.mt(8)));
-        rows.push(...this.prRows(pr, t, 1));
+        const key = `orphan:${pr.repo}`;
+        if (!heads.has(key)) {
+          heads.add(key);
+          rows.push(this.head(`orphan-${pr.repo}`, t, pr.repo, key, rows.length === 0).child(div().flex_1())
+            .child(svg(CHEVRON(!this.folded.has(key))).size(11).flex_none()));
+        }
+        if (!this.folded.has(key)) rows.push(...this.prRows(pr, t, 1));
       }
     }
     const links = m?.links ?? [];
-    // A card like the Files and Changes panels it sits beside.
-    return v_flex().id("tracks").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border)
-      .text_color(t.foreground).text_size(13)
-      .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().font_semibold().flex_none().child("Tracks"))
-        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(m?.title ?? "")))
-      .child(v_flex().id("tracks-list").flex_1().min_h(0).p(6).overflow_y_scrollbar().children(rows))
-      .when(links.length > 0, (e) => e.child(v_flex().flex_none().border_t(1).border_color(t.border)
-        .child(h_flex().id("links-rule").h(26).flex_none().px(14).gap(8).items_center().text_size(11).text_color(t.dim)
+    // Drawn like the Spaces sidebar: flat on the chrome, a small dim title, label-style bars.
+    return v_flex().id("tracks").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.chrome)
+      .text_color(mix(t.foreground, t.chrome, NAME_DIM)).text_size(13)
+      .child(h_flex().h(31).flex_none().pl(16).pr(12).gap(8).items_center().text_size(11.5).text_color(t.dim)
+        .child(div().flex_none().child("Tracks"))
+        .child(div().flex_1().min_w(0).truncate().text_right().child(m?.title ?? "")))
+      .child(v_flex().id("tracks-list").flex_1().min_h(0).px(8).pb(14).overflow_y_scrollbar().children(rows))
+      .when(links.length > 0, (e) => e.child(v_flex().flex_none().mx(8).border_t_1().border_color(t.border)
+        .child(h_flex().id("links-rule").h(26).flex_none().px(8).gap(7).items_center().text_size(11).text_color(t.dim)
           .on_mouse_down("right", () => this.menu([["Dismiss all links", { dismiss: "links" }]]))
-          .child("Links")
-          .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(String(links.length))))
-        .child(v_flex().id("tracks-links").h(Math.min(links.length, LINKS_SHOWN) * ROW + 6).flex_none().px(6).pb(6).overflow_y_scrollbar().children(this.linkRows(links, t)))));
+          .child(div().flex_1().child("Links"))
+          .child(div().flex_none().child(String(links.length))))
+        .child(v_flex().id("tracks-links").h(Math.min(links.length, LINKS_SHOWN) * ROW + 6).flex_none().pb(6).overflow_y_scrollbar().children(this.linkRows(links, t)))));
   }
 }
