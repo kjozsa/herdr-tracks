@@ -12,7 +12,9 @@ const BIN = "herdr-tracks";
 // Commits listed per repo and per pull request; older ones are counted on one more row.
 const COMMITS_SHOWN = 10;
 // Rows and icons as in Herdr's own Files, Changes and Spaces views.
-const ROW = 24;
+const ROW = 30;
+// files listed under an expanded commit sit tighter
+const FILE_ROW = 20;
 const INDENT = 18;
 // Pastel bars per repo, tinted like the labeled Spaces view: [rest, hover] alpha.
 const PASTELS = ["#f5c2e7", "#a6e3a1", "#89b4fa", "#f9e2af", "#cba6f7", "#94e2d5", "#fab387", "#f38ba8", "#b4befe", "#89dceb"];
@@ -187,10 +189,10 @@ export default class Tracks extends View {
     openOverlay({ mod: "tracks", kind: "popup", width: 210, height: items.length * 30 + 12, props: { menu: { items, terminal: this.agent?.address } } });
   }
 
-  row(id, t, selected, depth = 0) {
-    return h_flex().relative().id(id).h(ROW).flex_none().pl(8 + Math.max(0, depth - 1) * INDENT).pr(8).gap(9).items_center().rounded(8)
+  row(id, t, selected, depth = 0, height = ROW) {
+    return h_flex().relative().id(id).h(height).flex_none().pl(8 + Math.max(0, depth - 1) * INDENT).pr(8).gap(9).items_center().rounded(8)
       .when(selected, (e) => e.bg(mix(t.selected, t.chrome, 0.45)).text_color(t.foreground)
-        .child(div().absolute().left(0).top(4).bottom(4).w(3).rounded(2).bg(t.accent)))
+        .child(div().absolute().left(0).top(height > 24 ? 6 : 3).bottom(height > 24 ? 6 : 3).w(3).rounded(2).bg(t.accent)))
       .when(!selected, (e) => e.hover((s) => s.bg(t.hover)));
   }
 
@@ -303,7 +305,7 @@ export default class Tracks extends View {
     else if (files.error) rows.push(this.row(`files-err-${id}`, t, false, depth + 1).child(div().pl(23).truncate().text_size(12).text_color(t.ansi1).child(files.error)));
     else for (const f of files.files) {
       const key = `${c.hash}:${f.path}`;
-      rows.push(this.row(`cfile-${id}-${f.path}`, t, this.selected === key, depth + 1).cursor_pointer()
+      rows.push(this.row(`cfile-${id}-${f.path}`, t, this.selected === key, depth + 1, FILE_ROW).text_size(12).cursor_pointer()
         .on_click(() => this.select(key, { kind: "commit", commit: c.at, path: f.path }))
         .child(div().w(16).flex_none())
         .child(this.code(f.code, f.code === "A" ? t.ansi2 : f.code === "D" ? t.ansi1 : t.blocked))
