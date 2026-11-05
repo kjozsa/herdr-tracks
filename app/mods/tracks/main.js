@@ -15,6 +15,8 @@ const COMMITS_SHOWN = 10;
 const ROW = 30;
 // uncommitted files, and files under an expanded commit, sit tighter
 const CHANGE_ROW = 22;
+// commits and pull requests in a repo's history
+const COMMIT_ROW = 26;
 const FILE_ROW = 20;
 const INDENT = 18;
 // Pastel bars per repo, tinted like the labeled Spaces view: [rest, hover] alpha.
@@ -273,7 +275,7 @@ export default class Tracks extends View {
     const expanded = this.expanded.has(pr.url);
     const check = pr.checks && CHECKS[pr.checks];
     const state = t[PR_STATE[pr.state]] ?? t.dim;
-    const rows = [this.row(`pr-${pr.url}`, t, this.selected === pr.url, depth)
+    const rows = [this.row(`pr-${pr.url}`, t, this.selected === pr.url, depth, COMMIT_ROW)
       .on_mouse_down("right", () => this.menu([["Open on GitHub", { open: pr.url }], ["Dismiss PR", { dismiss: { pr: pr.target } }]]))
       .child(this.chevron(`pr-mark-${pr.url}`, expanded, () => this.toggle(pr.url), t))
       .child(svg(ICON("git-compare")).size(13).flex_none().text_color(state))
@@ -294,7 +296,7 @@ export default class Tracks extends View {
   commitRows(c, t, depth, under = "") {
     const expanded = this.expanded.has(c.hash);
     const id = `${under}:${c.hash}`;
-    const rows = [this.row(`commit-${id}`, t, this.selected === c.hash, depth)
+    const rows = [this.row(`commit-${id}`, t, this.selected === c.hash, depth, COMMIT_ROW)
       .child(this.chevron(`commit-mark-${id}`, expanded, () => this.expandCommit(c), t))
       .child(div().id(`commit-body-${id}`).flex_1().min_w(0).flex().items_center().gap(7).cursor_pointer()
         .on_click((e) => (e.modifiers.control && c.url ? open(c.url) : this.select(c.hash, c.diff)))
