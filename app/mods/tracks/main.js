@@ -283,7 +283,7 @@ export default class Tracks extends View {
       .child(this.chevron(`pr-mark-${pr.url}`, expanded, () => this.toggle(pr.url), t))
       .child(svg(ICON("git-compare")).size(13).flex_none().text_color(state))
       .child(div().id(`pr-link-${pr.url}`).flex_none().underline().text_color(t.foreground).cursor_pointer().hover((s) => s.text_color(t.accent))
-        .tooltip("Open on GitHub").on_click(() => open(pr.url)).child(`PR#${pr.number}`))
+        .tooltip("Open on GitHub").on_click(() => open(pr.url)).child(`PR #${pr.number}`))
       .child(div().id(`pr-title-${pr.url}`).flex_1().min_w(0).truncate().cursor_pointer().on_click(() => this.select(pr.url, pr.diff))
         .when(Boolean(pr.error && !pr.title), (e) => e.text_color(t.ansi1))
         .child(pr.title ?? pr.error ?? "…"))
