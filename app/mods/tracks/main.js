@@ -296,16 +296,16 @@ export default class Tracks extends View {
     const links = m?.links ?? [];
     // A card like the Files and Changes panels it sits beside.
     return v_flex().id("tracks").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border)
-      .font_family(MONO())
-      .text_color(t.foreground).text_size(12)
+      .text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().flex_none().child("Tracks"))
-        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(m?.title ?? "")))
+        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(m?.title ?? "")))
+      .child(v_flex().font_family(MONO()).text_size(12).flex_1().min_h(0)
       .child(v_flex().id("tracks-list").flex_1().min_h(0).py(4).overflow_y_scrollbar().children(rows))
       .when(links.length > 0, (e) => e.child(v_flex().flex_none().border_t(1).border_color(t.border)
         .child(h_flex().id("links-rule").h(ROW).flex_none().px(10).items_center().text_size(11).text_color(t.dim)
           .on_mouse_down("right", () => this.menu([["Dismiss all links", { dismiss: "links" }]]))
           .child(`links · ${links.length}`))
-        .child(v_flex().id("tracks-links").h(Math.min(links.length, LINKS_SHOWN) * ROW).flex_none().overflow_y_scrollbar().children(this.linkRows(links, t)))));
+        .child(v_flex().id("tracks-links").h(Math.min(links.length, LINKS_SHOWN) * ROW).flex_none().overflow_y_scrollbar().children(this.linkRows(links, t))))));
   }
 }
