@@ -297,7 +297,7 @@ export default class Tracks extends View {
       .child(this.chevron(`commit-mark-${id}`, expanded, () => this.expandCommit(c), t))
       .child(div().id(`commit-body-${id}`).flex_1().min_w(0).flex().items_center().gap(7).cursor_pointer()
         .on_click((e) => (e.modifiers.control && c.url ? open(c.url) : this.select(c.hash, c.diff)))
-        .child(div().min_w(0).flex_1().truncate().text_color(c.chat ? t.foreground : t.dim).child(c.subject))
+        .child(div().min_w(0).flex_1().truncate().text_color(c.chat ? mix(t.foreground, t.chrome, 0.38) : mix(t.dim, t.chrome, 0.2)).child(c.subject))
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(short(c.hash))))];
     if (!expanded) return rows;
     const files = this.model?.files?.[c.hash];
