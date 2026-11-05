@@ -35,6 +35,8 @@ const CHEVRON = (open) => `mods/files/chevron-${open ? "down" : "right"}.svg`;
 // Link rows in view; more scroll.
 const LINKS_SHOWN = 8;
 
+// Merge commits say nothing the PR or branch doesn't; GitHub gives no subject for a PR's own.
+const isMerge = (c) => c.subject === "merge commit" || /^Merge (pull request|branch|remote-tracking branch|commit) /.test(c.subject ?? "");
 const short = (hash) => hash.slice(0, 7);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const linkText = (url) => url.replace(/^https?:\/\//, "").replace(/^www\./, "");
@@ -262,8 +264,9 @@ export default class Tracks extends View {
         .children(statText(c.stat, t)));
     }
     let loose = 0;
-    const looseTotal = repo.history.filter((h) => h.commit).length;
-    for (const entry of repo.history) {
+    const history = repo.history.filter((h) => !(h.commit && isMerge(h.commit)));
+    const looseTotal = history.filter((h) => h.commit).length;
+    for (const entry of history) {
       if (entry.pr) rows.push(...this.prRows(entry.pr, t, 1));
       else if (++loose <= COMMITS_SHOWN) rows.push(...this.commitRows(entry.commit, t, 1));
       else if (loose === COMMITS_SHOWN + 1) rows.push(this.dim(`more-${repo.root}`, t, 1, `${plural(looseTotal - COMMITS_SHOWN, "earlier commit")}…`));
@@ -279,17 +282,18 @@ export default class Tracks extends View {
       .on_mouse_down("right", () => this.menu([["Open on GitHub", { open: pr.url }], ["Dismiss PR", { dismiss: { pr: pr.target } }]]))
       .child(this.chevron(`pr-mark-${pr.url}`, expanded, () => this.toggle(pr.url), t))
       .child(svg(ICON("git-compare")).size(13).flex_none().text_color(state))
+      .child(div().id(`pr-link-${pr.url}`).flex_none().underline().text_color(t.foreground).cursor_pointer().hover((s) => s.text_color(t.accent))
+        .tooltip("Open on GitHub").on_click(() => open(pr.url)).child(`PR#${pr.number}`))
       .child(div().id(`pr-title-${pr.url}`).flex_1().min_w(0).truncate().cursor_pointer().on_click(() => this.select(pr.url, pr.diff))
-        .text_color(pr.error && !pr.title ? t.ansi1 : t.foreground)
+        .when(Boolean(pr.error && !pr.title), (e) => e.text_color(t.ansi1))
         .child(pr.title ?? pr.error ?? "…"))
       .when(Boolean(check), (e) => e.child(div().flex_none().text_size(11.5).text_color(t[check[1]]).child(check[0])))
-      .child(div().id(`pr-link-${pr.url}`).flex_none().text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
-        .tooltip("Open on GitHub").on_click(() => open(pr.url)).child(`#${pr.number}`))
       .when(Boolean(pr.state), (e) => e.child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(state).child(pr.state)))];
     if (!expanded) return rows;
     if (!pr.commits) return [...rows, this.dim(`pr-wait-${pr.url}`, t, depth + 1, "Loading…")];
-    for (const c of pr.commits.slice(0, COMMITS_SHOWN)) rows.push(...this.commitRows(c, t, depth + 1, pr.url));
-    if (pr.commits.length > COMMITS_SHOWN) rows.push(this.dim(`pr-more-${pr.url}`, t, depth + 1, `${plural(pr.commits.length - COMMITS_SHOWN, "earlier commit")}…`));
+    const commits = pr.commits.filter((c) => !isMerge(c));
+    for (const c of commits.slice(0, COMMITS_SHOWN)) rows.push(...this.commitRows(c, t, depth + 1, pr.url));
+    if (commits.length > COMMITS_SHOWN) rows.push(this.dim(`pr-more-${pr.url}`, t, depth + 1, `${plural(commits.length - COMMITS_SHOWN, "earlier commit")}…`));
     return rows;
   }
 
