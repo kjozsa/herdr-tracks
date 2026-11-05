@@ -13,7 +13,8 @@ const BIN = "herdr-tracks";
 const COMMITS_SHOWN = 10;
 // Rows and icons as in Herdr's own Files, Changes and Spaces views.
 const ROW = 30;
-// files listed under an expanded commit sit tighter
+// uncommitted files, and files under an expanded commit, sit tighter
+const CHANGE_ROW = 22;
 const FILE_ROW = 20;
 const INDENT = 18;
 // Pastel bars per repo, tinted like the labeled Spaces view: [rest, hover] alpha.
@@ -252,7 +253,7 @@ export default class Tracks extends View {
     if (repo.error) rows.push(this.row(`repo-err-${repo.root}`, t, false, 1).child(div().truncate().text_size(12).text_color(t.ansi1).child(repo.error)));
     for (const c of repo.changes ?? []) {
       const key = `${repo.root}:${c.path}`;
-      rows.push(this.row(`file-${key}`, t, this.selected === key, 1).cursor_pointer()
+      rows.push(this.row(`file-${key}`, t, this.selected === key, 1, CHANGE_ROW).cursor_pointer()
         .on_click(() => this.select(key, c.diff))
         .child(this.code(c.code.trim() === "??" ? "U" : c.code.trim(), changeColor(c.code, t)))
         .child(this.path(c.display, t))
