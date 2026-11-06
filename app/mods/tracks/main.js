@@ -17,6 +17,7 @@ const ROW = 30;
 const CHANGE_ROW = 22;
 // commits and pull requests in a repo's history
 const COMMIT_ROW = 26;
+const LINK_ROW = 22;
 const FILE_ROW = 20;
 const INDENT = 18;
 // Pastel bars per repo, tinted like the labeled Spaces view: [rest, hover] alpha.
@@ -323,7 +324,7 @@ export default class Tracks extends View {
   }
 
   linkRows(links, t) {
-    return links.map((url) => this.row(`link-${url}`, t).cursor_pointer()
+    return links.map((url) => this.row(`link-${url}`, t, false, 0, LINK_ROW).cursor_pointer()
       .on_click(() => open(url))
       .on_mouse_down("right", () => this.menu([["Open in browser", { open: url }], ["Dismiss link", { dismiss: { link: url } }], ["Dismiss all links", { dismiss: "links" }]]))
       .child(div().min_w(0).truncate().text_color(t.ansi4).child(linkText(url))));
@@ -381,6 +382,6 @@ export default class Tracks extends View {
           .on_mouse_down("right", () => this.menu([["Dismiss all links", { dismiss: "links" }]]))
           .child(div().flex_1().child("Links"))
           .child(div().flex_none().child(String(links.length))))
-        .child(v_flex().id("tracks-links").h(Math.min(links.length, LINKS_SHOWN) * ROW + 6).flex_none().pb(6).overflow_y_scrollbar().children(this.linkRows(links, t)))));
+        .child(v_flex().id("tracks-links").h(Math.min(links.length, LINKS_SHOWN) * LINK_ROW + 6).flex_none().pb(6).overflow_y_scrollbar().children(this.linkRows(links, t)))));
   }
 }
