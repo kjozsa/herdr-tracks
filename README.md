@@ -69,7 +69,9 @@ last written while one of the chat's tool calls ran (shell edits in a chat begun
 herdr). Repos the chat only read are not
 listed, unless one of its pull requests belongs to them. Pull requests are those the chat
 created with `gh pr create`, or referred to: a pull request URL in your message, omp's `pr://`
-reads, or `gh pr view/diff/checkout/review/…`.
+reads, or `gh pr view/diff/checkout/review/…`. What Claude Code's subagents do (a forked skill
+like `/code-review 104`, a background agent) counts as the chat's: their pull requests, edits
+and tool calls show too.
 
 The bottom of the sidebar collects the **links** of the chat, newest first: web links in your
 messages, in the agent's replies, and pages its tools read or fetched (not tool output). It

@@ -48,6 +48,8 @@ pub struct Transcript {
     running: HashMap<String, i64>,
     /// Timestamp (unix milliseconds) of the transcript line being scanned.
     line_ms: Option<i64>,
+    /// Claude Code subagents' transcripts (`<session>/subagents/agent-*.jsonl`), by path.
+    subagents: HashMap<PathBuf, Transcript>,
 }
 
 /// What the agent did in transcript lines appended since the last poll.
@@ -92,6 +94,7 @@ impl Transcript {
             pr_calls: HashSet::new(),
             running: HashMap::new(),
             line_ms: None,
+            subagents: HashMap::new(),
         }
     }
 
@@ -101,8 +104,8 @@ impl Transcript {
     }
 
     /// Start times (unix milliseconds) of the tool calls still running.
-    pub fn running(&self) -> impl Iterator<Item = i64> + '_ {
-        self.running.values().copied()
+    pub fn running(&self) -> Box<dyn Iterator<Item = i64> + '_> {
+        Box::new(self.running.values().copied().chain(self.subagents.values().flat_map(Transcript::running)))
     }
 
     pub fn poll(&mut self) -> std::io::Result<Activity> {
@@ -133,7 +136,35 @@ impl Transcript {
             }
         }
         self.pending = lines[complete..].to_vec();
+        self.poll_subagents(&mut found);
         Ok(found)
+    }
+
+    /// Work a Claude Code subagent did (a forked skill, a background agent) is the chat's: its
+    /// pull requests, repos and tool-call windows count. Its touches carry no position, since
+    /// its lines don't order against the chat's, so they don't bring dismissed repos back; its
+    /// links stay out (its replies reach the chat anyway).
+    fn poll_subagents(&mut self, found: &mut Activity) {
+        if self.format != Format::Claude {
+            return;
+        }
+        let Some(dir) = self.path.as_ref().map(|p| p.with_extension("").join("subagents")) else { return };
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("agent-") && name.ends_with(".jsonl") && !self.subagents.contains_key(&path) {
+                let child = Transcript::new(Format::Claude, path.to_string_lossy().into_owned(), self.cwd.clone());
+                self.subagents.insert(path, child);
+            }
+        }
+        for child in self.subagents.values_mut() {
+            let Ok(activity) = child.poll() else { continue };
+            found.touches.extend(activity.touches.into_iter().map(|t| Touch { at: None, ..t }));
+            found.prs.extend(activity.prs);
+            found.pr_numbers.extend(activity.pr_numbers);
+            found.calls.extend(activity.calls);
+        }
     }
 
     fn scan_omp(&mut self, line: &[u8], found: &mut Activity) {
@@ -749,6 +780,25 @@ mod tests {
             "relative paths resolve against each entry's cwd"
         );
         assert_eq!(activity.prs, [PrRef { owner: "o".into(), repo: "r".into(), number: 19 }], "u9 was no gh pr create");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn subagent_transcripts_add_their_prs_and_repos_without_positions() {
+        let bash = |cwd: &str, id: &str, command: &str| {
+            format!(r#"{{"type":"assistant","cwd":"{cwd}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"{command}"}}}}]}}}}"#)
+        };
+        let skill = r#"{"type":"assistant","cwd":"/w","message":{"role":"assistant","content":[{"type":"tool_use","id":"s1","name":"Skill","input":{"skill":"code-review","args":"104"}}]}}"#;
+        let (mut t, file) = transcript("subagents", Format::Claude, &format!("{skill}\n"));
+        assert!(t.poll().unwrap().pr_numbers.is_empty(), "the chat itself names no PR");
+        let agents = file.with_extension("").join("subagents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("agent-a1.meta.json"), "{}").unwrap();
+        std::fs::write(agents.join("agent-a1.jsonl"), format!("{}\n", bash("/w/review", "b1", "gh pr view 104 --json title"))).unwrap();
+        let activity = t.poll().unwrap();
+        assert_eq!(activity.pr_numbers, [(104, PathBuf::from("/w/review"))]);
+        assert!(activity.touches.iter().all(|touch| touch.at.is_none()), "subagent lines don't order against the chat's");
+        assert!(t.poll().unwrap().pr_numbers.is_empty(), "read once");
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
