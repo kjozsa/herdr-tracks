@@ -289,7 +289,7 @@ export default class Tracks extends View {
         .when(Boolean(pr.error && !pr.title), (e) => e.text_color(t.ansi1))
         .child(pr.title ?? pr.error ?? "…"))
       .when(Boolean(check), (e) => e.child(div().flex_none().text_size(11.5).text_color(t[check[1]]).child(check[0])))
-      .when(Boolean(pr.state), (e) => e.child(div().flex_none().px(7).py(1).rounded(5).border_1().border_color(mix(state, t.chrome, 0.45)).bg(mix(state, t.chrome, 0.8)).text_size(10.5).font_semibold().text_color(state).child(pr.state)))];
+      .when(Boolean(pr.state), (e) => e.child(div().flex_none().px(7).py(1).rounded(5).bg(state).text_size(10.5).font_bold().text_color(t.chrome).child(pr.state)))];
     if (!expanded) return rows;
     if (!pr.commits) return [...rows, this.dim(`pr-wait-${pr.url}`, t, depth + 1, "Loading…")];
     const commits = pr.commits.filter((c) => !isMerge(c));
