@@ -78,7 +78,7 @@ export default class TracksDiff extends View {
   move(by) {
     const half = Math.floor(this.page / 2);
     const last = Math.max(half, this.rows.length - 1 - half);
-    const target = by === Infinity ? last : by === -Infinity ? half : this.center + by;
+    const target = by === Infinity ? last : by === -Infinity ? half : Math.round(this.center) + by;
     this.center = Math.min(last, Math.max(half, target));
     this.scroll.scroll_to_item(this.center, "center");
   }
@@ -156,7 +156,12 @@ export default class TracksDiff extends View {
         if (e.keystroke === "escape" || e.keystroke === "q") { this.closePane(); cx.stop_propagation(); }
         else if (this.key(e.keystroke)) cx.stop_propagation();
       })
-      .on_scroll_wheel((e) => { this.center = Math.max(0, this.center - e.delta.y / ROW); })
+      .on_mouse_down("left", () => { if (!this.handle.is_focused()) this.handle.focus(); })
+      .on_scroll_wheel((e) => {
+        const half = Math.floor(this.page / 2);
+        const dy = e.delta_lines ? e.delta_lines.y : e.delta.y / ROW;
+        this.center = Math.min(Math.max(half, this.rows.length - 1 - half), Math.max(half, this.center - dy));
+      })
       .child(h_flex().h(30).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).truncate().font_semibold().child(title(this.request)))
         .when(Boolean(this.loading), (e) => e.child(div().text_size(11).text_color(t.dim).child("…")))
