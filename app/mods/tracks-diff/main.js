@@ -40,11 +40,13 @@ function rows(text) {
   });
 }
 
+const PAGE_KEYS = ["pageup", "pagedown", "home", "end"];
+
 export default class TracksDiff extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
     this.request = null;
-    this.key = null;
+    this.loaded = null;
     this.rows = [];
     this.width = 0;
     this.error = null;
@@ -54,6 +56,8 @@ export default class TracksDiff extends View {
     this.center = 0;
     this.page = 20;
     cx.timer.every(1000, (cx) => this.load(cx, true));
+    // page keys bound in our own context, so no app-wide binding takes them first
+    cx.bind_keys(PAGE_KEYS.map((k) => ({ keystroke: k, action: `tracks_diff::${k}`, context: "TracksDiff" })));
     this.focus(cx);
     cx.spawn(async (cx) => {
       for (;;) {
@@ -95,9 +99,9 @@ export default class TracksDiff extends View {
   load(cx, notify) {
     const request = shared(`tracks.diff.${props()?.tab}`) ?? null;
     const key = JSON.stringify(request);
-    const changed = key !== this.key;
+    const changed = key !== this.loaded;
     if (!changed && (this.loading || Date.now() < this.next || !AGAIN_MS[request?.kind])) return;
-    this.key = key;
+    this.loaded = key;
     this.request = request;
     this.next = Date.now() + (AGAIN_MS[request?.kind] ?? 0);
     if (changed) {
@@ -114,7 +118,7 @@ export default class TracksDiff extends View {
         const tab = String(props()?.tab ?? "");
         const on = tab.includes("/") ? tab.slice(0, tab.indexOf("/")) : null;
         const r = await execFile(BIN, ["app", "patch", key], { on });
-        if (this.key !== key) return;
+        if (this.loaded !== key) return;
         if (r.code !== 0) { this.error = r.stderr.trim() || "no diff"; this.rows = []; this.text = null; }
         else {
           this.error = r.stdout.trim() ? null : "no changes";
@@ -125,7 +129,7 @@ export default class TracksDiff extends View {
           }
         }
       } catch (e) {
-        if (this.key === key) this.error = String(e);
+        if (this.loaded === key) this.error = String(e);
       } finally {
         this.loading = false;
         cx.notify();
@@ -150,12 +154,16 @@ export default class TracksDiff extends View {
   render(cx) {
     this.load(cx, false);
     const t = theme();
-    return v_flex().id("tracks-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12).track_focus(this.handle)
-      .on_size_change((size) => { this.page = Math.max(1, Math.floor((size.height - 30) / ROW)); })
+    return v_flex().id("tracks-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12).track_focus(this.handle).key_context("TracksDiff")
+      .on_size_change((size) => { this.page = Math.max(1, Math.floor((size.height / settings().zoom - 30) / ROW)); })
       .on_key_down((e, cx) => {
         if (e.keystroke === "escape" || e.keystroke === "q") { this.closePane(); cx.stop_propagation(); }
         else if (this.key(e.keystroke)) cx.stop_propagation();
       })
+      .on_action("tracks_diff::pageup", (_e, cx) => { this.key("pageup"); cx.notify(); })
+      .on_action("tracks_diff::pagedown", (_e, cx) => { this.key("pagedown"); cx.notify(); })
+      .on_action("tracks_diff::home", (_e, cx) => { this.key("home"); cx.notify(); })
+      .on_action("tracks_diff::end", (_e, cx) => { this.key("end"); cx.notify(); })
       .on_mouse_down("left", () => { if (!this.handle.is_focused()) this.handle.focus(); })
       .on_scroll_wheel((e) => {
         const half = Math.floor(this.page / 2);
