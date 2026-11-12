@@ -156,8 +156,14 @@ fn take_inbox() -> Vec<Queued> {
 fn chat(agent: &Agent) -> Chat {
     let tree = agent.pid.map(repos::process_tree).unwrap_or_default();
     let session = (agent.app == "claude-code").then(|| claude_session(agent.foreground_pid.into_iter().chain(tree.iter().copied()))).flatten();
-    let mut cwds: Vec<PathBuf> = [&agent.foreground_cwd, &agent.cwd].into_iter().flatten().map(PathBuf::from).collect();
-    cwds.extend(tree.iter().filter_map(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok()));
+    // the terminal's own cwd can be stale (its start folder after a `cd` the shell never reported),
+    // so it only counts when the live process tree can't be read
+    let live: Vec<PathBuf> = tree.iter().filter_map(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok()).collect();
+    let mut cwds: Vec<PathBuf> = agent.foreground_cwd.iter().map(PathBuf::from).collect();
+    if live.is_empty() {
+        cwds.extend(agent.cwd.iter().map(PathBuf::from));
+    }
+    cwds.extend(live);
     Chat {
         pane: agent.address.clone(),
         terminal: agent.address.clone(),

@@ -21,10 +21,13 @@ pub(super) fn find(me: &str, previous: Option<&str>) -> Result<Option<Chat>> {
     else {
         return Ok(None);
     };
-    let mut cwds: Vec<PathBuf> = [&target.foreground_cwd, &target.cwd].into_iter().flatten().map(PathBuf::from).collect();
-    if let Some(pid) = herdr::pane_process_info(&target.pane_id)?.shell_pid {
-        cwds.extend(repos::process_tree_cwds(pid));
+    // the pane's own cwd can be stale, so it only counts when the live process tree can't be read
+    let live = herdr::pane_process_info(&target.pane_id)?.shell_pid.map(repos::process_tree_cwds).unwrap_or_default();
+    let mut cwds: Vec<PathBuf> = target.foreground_cwd.iter().map(PathBuf::from).collect();
+    if live.is_empty() {
+        cwds.extend(target.cwd.iter().map(PathBuf::from));
     }
+    cwds.extend(live);
     Ok(Some(Chat {
         pane: target.pane_id.clone(),
         terminal: target.terminal_id.clone(),
