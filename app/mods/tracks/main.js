@@ -12,11 +12,11 @@ const BIN = "herdr-tracks";
 // Commits listed per repo and per pull request; older ones are counted on one more row.
 const COMMITS_SHOWN = 10;
 // Rows and icons as in Herdr's own Files, Changes and Spaces views.
-const ROW = 30;
+const ROW = 25;
 // uncommitted files, and files under an expanded commit, sit tighter
 const CHANGE_ROW = 22;
 // commits and pull requests in a repo's history
-const COMMIT_ROW = 26;
+const COMMIT_ROW = 25;
 const LINK_ROW = 22;
 const FILE_ROW = 20;
 const INDENT = 18;
@@ -229,7 +229,7 @@ export default class Tracks extends View {
     const dark = settings().dark !== false;
     const c = pastel(name), tint = BAR_TINT[dark ? "dark" : "light"], ink = dark ? c : t.foreground;
     const folded = this.folded.has(key);
-    return h_flex().id(id).h(26).flex_none().when(!first, (e) => e.mt(6)).px(8).gap(7).items_center().text_size(12).font_bold()
+    return h_flex().id(id).h(24).flex_none().when(!first, (e) => e.mt(2)).px(8).gap(7).items_center().text_size(12).font_bold()
       .rounded(7).bg(`${c}${tint[0]}`).text_color(ink).cursor_pointer().hover((s) => s.bg(`${c}${tint[1]}`))
       .on_click((_e, cx) => {
         if (!this.folded.delete(key)) this.folded.add(key);
